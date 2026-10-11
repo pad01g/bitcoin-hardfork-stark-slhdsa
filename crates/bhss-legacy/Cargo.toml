@@ -1,0 +1,18 @@
+[package]
+name = "bhss-legacy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Legacy Bitcoin (secp256k1) spending-condition verification for BHSS migration proofs"
+
+[dependencies]
+bhss-primitives = { workspace = true }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+k256 = { workspace = true, features = ["ecdsa", "schnorr", "alloc"] }
+
+[features]
+default = ["std"]
+std = ["bhss-primitives/std", "sha2/std", "ripemd/std", "k256/std"]
+# Host-side helpers: signing, key tweaking and script construction (never in the guest).
+sign = ["std"]

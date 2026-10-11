@@ -1,0 +1,31 @@
+# Vendored copy of slh-dsa 0.1.0 (RustCrypto/signatures, Apache-2.0 OR MIT).
+# Only change: `signature` pinned to the stable 2.2 line so it can share a
+# dependency graph with k256 0.13 (which rejects the 2.3.0-pre series).
+[package]
+name = "slh-dsa"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Pure Rust implementation of SLH-DSA (aka SPHINCS+) as described in the FIPS-205 standard (vendored for BHSS)"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/RustCrypto/signatures"
+
+[lib]
+name = "slh_dsa"
+path = "src/lib.rs"
+bench = false
+
+[dependencies]
+digest = "0.10.7"
+hmac = "0.12.1"
+hybrid-array = { version = "0.2.0-rc.8", features = ["extra-sizes"] }
+rand_core = "0.6.4"
+sha2 = { version = "0.10.8", default-features = false }
+sha3 = { version = "0.10.8", default-features = false }
+signature = { version = "2.2", features = ["rand_core"] }
+typenum = { version = "1.17.0", features = ["const-generics"] }
+zerocopy = { version = "0.7.34", features = ["derive"] }
+
+[features]
+alloc = []
+default = ["alloc"]

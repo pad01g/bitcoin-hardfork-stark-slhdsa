@@ -1,0 +1,12 @@
+[package]
+name = "bhss-methods"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RISC Zero guest programs (block validity, legacy migration) and their image IDs"
+
+[build-dependencies]
+risc0-build = { workspace = true }
+
+[package.metadata.risc0]
+methods = ["guest"]

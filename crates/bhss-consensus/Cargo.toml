@@ -1,0 +1,18 @@
+[package]
+name = "bhss-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BHSS consensus rules: the executable form of docs/SPEC.md (no_std, shared by node and zkVM guest)"
+
+[dependencies]
+bhss-primitives = { workspace = true }
+bhss-smt = { workspace = true }
+bhss-slhdsa = { workspace = true }
+
+[dev-dependencies]
+bhss-smt = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["bhss-primitives/std", "bhss-smt/std", "bhss-slhdsa/std"]

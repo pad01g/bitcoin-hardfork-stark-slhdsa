@@ -1,0 +1,15 @@
+[package]
+name = "bhss-slhdsa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SLH-DSA-SHA2-128s (FIPS 205) wrapper used by BHSS consensus"
+
+[dependencies]
+bhss-primitives = { workspace = true }
+slh-dsa = { workspace = true, features = ["alloc"] }
+rand_core = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["bhss-primitives/std", "rand_core/std"]

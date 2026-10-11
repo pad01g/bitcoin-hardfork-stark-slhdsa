@@ -1,0 +1,6 @@
+# Runtime image for bhssd / bhss-cli: copies release binaries built by `make bins`.
+FROM --platform=linux/amd64 debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl jq libssl3 && rm -rf /var/lib/apt/lists/*
+COPY bin/bhssd bin/bhss-cli bin/bhss-snapshot /usr/local/bin/
+ENV RUST_LOG=info
+ENTRYPOINT ["bhssd"]

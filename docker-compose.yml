@@ -1,0 +1,41 @@
+# Three-node regtest used by tests/e2e.sh. Built from ./bin via docker/Dockerfile.node.
+services:
+  node1:
+    build: { context: ., dockerfile: docker/Dockerfile.node }
+    image: bhss-node:latest
+    platform: linux/amd64
+    command: ["--datadir", "/data", "--params", "/net/params.json", "--genesis-state", "/net/genesis_state.bin",
+              "--p2p-bind", "0.0.0.0:18555", "--rpc-bind", "0.0.0.0:18443",
+              "--prove-mode", "${PROVE_MODE:-dev}", "--segment-po2", "${SEGMENT_PO2:-17}"]
+    volumes: [".e2e/net:/net:ro", ".e2e/node1:/data"]
+    ports: ["18443:18443"]
+  node2:
+    image: bhss-node:latest
+    platform: linux/amd64
+    command: ["--datadir", "/data", "--params", "/net/params.json", "--genesis-state", "/net/genesis_state.bin",
+              "--p2p-bind", "0.0.0.0:18555", "--rpc-bind", "0.0.0.0:18443", "--connect", "node1:18555",
+              "--prove-mode", "${PROVE_MODE:-dev}", "--segment-po2", "${SEGMENT_PO2:-17}"]
+    volumes: [".e2e/net:/net:ro", ".e2e/node2:/data"]
+    ports: ["18444:18443"]
+    depends_on: [node1]
+  node3:
+    image: bhss-node:latest
+    platform: linux/amd64
+    command: ["--datadir", "/data", "--params", "/net/params.json", "--genesis-state", "/net/genesis_state.bin",
+              "--p2p-bind", "0.0.0.0:18555", "--rpc-bind", "0.0.0.0:18443", "--connect", "node2:18555",
+              "--prove-mode", "${PROVE_MODE:-dev}", "--segment-po2", "${SEGMENT_PO2:-17}"]
+    volumes: [".e2e/net:/net:ro", ".e2e/node3:/data"]
+    ports: ["18445:18443"]
+    depends_on: [node2]
+  cli:
+    image: bhss-node:latest
+    platform: linux/amd64
+    profiles: ["tools"]
+    entrypoint: ["bhss-cli"]
+    volumes: [".e2e/wallet:/wallet", ".e2e/net:/net:ro"]
+  tools:
+    image: bhss-node:latest
+    platform: linux/amd64
+    profiles: ["tools"]
+    entrypoint: ["bhss-snapshot"]
+    volumes: [".e2e/net:/net"]

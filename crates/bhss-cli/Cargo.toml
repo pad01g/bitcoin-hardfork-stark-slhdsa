@@ -1,0 +1,27 @@
+[package]
+name = "bhss-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BHSS wallet / RPC command line: keys, addresses, spending, legacy migration proofs"
+
+[[bin]]
+name = "bhss-cli"
+path = "src/main.rs"
+
+[dependencies]
+bhss-primitives = { workspace = true, features = ["std", "serde", "address"] }
+bhss-slhdsa = { workspace = true }
+bhss-legacy = { workspace = true, features = ["sign"] }
+bhss-consensus = { workspace = true }
+bhss-prover = { workspace = true }
+k256 = { workspace = true, features = ["std"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
+hex = { workspace = true, features = ["std"] }
+bech32 = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+tracing-subscriber = { workspace = true }

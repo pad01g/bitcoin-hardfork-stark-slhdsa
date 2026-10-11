@@ -1,0 +1,13 @@
+[package]
+name = "bhss-smt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SHA-256 sparse Merkle tree (depth 256) used as the BHSS UTXO commitment (no_std)"
+
+[dependencies]
+bhss-primitives = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["bhss-primitives/std"]

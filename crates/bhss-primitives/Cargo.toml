@@ -1,0 +1,18 @@
+[package]
+name = "bhss-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BHSS consensus data types, canonical encoding and tagged hashing (no_std)"
+
+[dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true, optional = true }
+bech32 = { version = "0.11", default-features = false, features = ["alloc"], optional = true }
+
+[features]
+default = ["std"]
+std = ["sha2/std", "hex/std"]
+serde = ["dep:serde"]
+address = ["dep:bech32"]
