@@ -1,147 +1,231 @@
 # BHSS — bitcoin-hardfork-stark-slhdsa
 
-A Bitcoin regtest/signet-style hard fork, written from scratch in Rust, where
+BHSS is an experimental regtest chain, written from scratch in Rust, whose
+genesis state is a Bitcoin UTXO snapshot. Its rules differ from Bitcoin's in
+four ways:
 
-* every block carries a **RISC Zero STARK** proving its own validity and nodes
-  *also* re-validate everything natively (double verification),
-* the only signature scheme for new coins is **SLH-DSA-SHA2-128s** (FIPS 205),
-* the UTXO set is committed in a **SHA-256 sparse Merkle tree** and every input
-  carries an inclusion proof,
-* legacy (secp256k1) coins from a Bitcoin Core `dumptxoutset` snapshot can be
-  spent only through a **migration proof** (a per-transaction STARK of the
-  legacy authorization) into SLH-DSA outputs.
+* Every block carries a **RISC Zero succinct STARK receipt** proving that the
+  block is valid, and every node also validates the block natively (double
+  verification).
+* New coins can be locked only by **SLH-DSA-SHA2-128s** keys (FIPS 205).
+  There is no script language.
+* The UTXO set is committed by a **SHA-256 sparse Merkle tree**, and every
+  block carries a Merkle proof for each coin it spends or creates.
+* Legacy (secp256k1) coins from a Bitcoin Core `dumptxoutset` snapshot can
+  only be moved into SLH-DSA outputs, by a transaction that carries one
+  **migration proof** per input: a STARK showing that the owner of the
+  legacy script authorized the move.
+
+BHSS shares no code, block format or network protocol with Bitcoin Core and
+does not validate Bitcoin's block history.
 
 The consensus rules are specified in [`docs/SPEC.md`](docs/SPEC.md) (English,
-Japanese summaries per chapter); design choices are recorded in
+with a Japanese summary per chapter). The reasons for the design are in
 [`docs/DECISIONS.md`](docs/DECISIONS.md).
+[`docs/HASH_FUNCTION_TRADEOFF.md`](docs/HASH_FUNCTION_TRADEOFF.md) estimates
+what replacing the STARK's internal hash with SHA-256 would cost.
+
+## Read this first
+
+* **Regtest only.** Proof of work is trivial and difficulty never adjusts.
+  Anyone who can reach a node can extend or rewrite the chain. BHSS is not
+  suitable for holding value.
+* **What the proof system protects.** Nodes check every rule natively
+  except the secp256k1 authorization of legacy coins, which is checked only
+  inside the migration proof. A failure of the proof system can therefore
+  affect un-migrated legacy coins, and nothing else.
+* **What "hash-based" and "post-quantum" mean here.** The proof system is a
+  FRI-based STARK: no Groth16, no pairing, no trusted setup. Its internal
+  hash is **Poseidon2 over the BabyBear field, not SHA-256**, and its
+  security level is RISC Zero's *conjectured* 97 bits. Coins created under
+  BHSS rules are locked by a post-quantum signature scheme. Un-migrated
+  legacy coins are still secp256k1 coins. No claim is made about the proof
+  system's security against quantum attackers.
+* **Dev-mode receipts prove nothing.** `--prove-mode dev`, the default,
+  produces RISC Zero fake receipts. A chain accepts them when its parameter
+  `require_real_proofs` is `false`, which is the case for every network the
+  tools create unless `bhss-snapshot from-dump --require-real-proofs` is
+  used. On such a chain anyone can spend any legacy coin without its key.
+* **No RPC authentication.** Any caller of the JSON-RPC interface can mine
+  blocks and submit transactions. `bhssd` binds it to `127.0.0.1` by
+  default; do not expose it. The peer-to-peer protocol is unauthenticated
+  and unencrypted.
+* **Guest image IDs are part of the network definition.** `bhss-snapshot`
+  writes the image IDs of the guest programs it was built with into
+  `params.json`, and a node refuses a network whose IDs differ from the
+  guests in its own binary. After any change to the guest code, to a crate
+  the guest uses, or to the RISC Zero toolchain, regenerate the network
+  with `bhss-snapshot`. A `params.json` with an unknown or missing field is
+  rejected.
+* **The guest build is not reproducible.** Two builds produce the same
+  image IDs only if they use the same development image
+  (`docker/Dockerfile`, which pins its base image by digest and the RISC
+  Zero components by version).
+* **Unaudited cryptography.** Nothing here has been audited. The vendored
+  `slh-dsa` crate states that it has never been independently audited.
+* **Wallet keys.** `bhss-cli` stores SLH-DSA secret keys unencrypted and
+  takes legacy secp256k1 secrets on the command line.
+* **Licence.** The Cargo manifests declare `MIT OR Apache-2.0`. The
+  repository contains no licence file of its own; `vendor/slh-dsa` carries
+  the licence files of that crate.
 
 ## Layout
 
 | Crate | Role |
 |-------|------|
-| `bhss-primitives` | types, canonical encoding, tagged hashing, chain params, addresses (`no_std`) |
-| `bhss-smt` | sparse Merkle tree and proof verification (`no_std`) |
-| `bhss-slhdsa` | SLH-DSA-SHA2-128s wrapper (vendored `slh-dsa` 0.1.0) |
-| `bhss-legacy` | legacy script templates + secp256k1 verification for migrations |
-| `bhss-consensus` | the executable form of `SPEC.md`, shared by node and zkVM guest |
-| `bhss-methods` | RISC Zero guests: `block` (full block validity) and `migrate` |
-| `bhss-prover` | host-side proving (dev / real), receipt verification |
-| `bhss-node` (`bhssd`) | chain state, mempool, miner+prover, gossip P2P, JSON-RPC |
-| `bhss-cli` | keys, addresses, spending, migration proofs |
-| `bhss-snapshot` | `dumptxoutset` parser and genesis state builder |
+| `bhss-primitives` | types, canonical encoding, tagged hashing, chain parameters, addresses |
+| `bhss-smt` | sparse Merkle tree and proof verification |
+| `bhss-slhdsa` | SLH-DSA-SHA2-128s wrapper around the vendored `slh-dsa` 0.1.0 |
+| `bhss-legacy` | legacy script templates and secp256k1 verification for migrations |
+| `bhss-consensus` | the executable form of `docs/SPEC.md`, shared by the node and the zkVM guest |
+| `bhss-methods` | the RISC Zero guest programs `block` (full block validity) and `migrate` |
+| `bhss-prover` | host-side proving (dev or real) and receipt verification |
+| `bhss-node` (`bhssd`) | chain state, mempool, miner and prover, gossip P2P, JSON-RPC |
+| `bhss-cli` | keys, addresses, spending, migration proofs, raw RPC calls |
+| `bhss-snapshot` | `dumptxoutset` parser and network definition (`params.json`, `genesis_state.bin`) |
 
-## Running (everything through Docker)
+## Building and testing
+
+All builds, tests and proving run in Docker. The host needs Docker with
+Compose and `make`; the end-to-end tests also need `bash`, `curl` and `jq`.
+No Rust or RISC Zero toolchain is needed on the host.
 
 ```sh
-make image      # build the dev image (Rust + RISC Zero toolchain, linux/amd64)
-make test       # unit + integration tests, dev-mode proofs (seconds)
-make bins       # release binaries into ./bin
-make e2e        # 3-node regtest end-to-end test, dev-mode proofs
-make prove      # real STARK for a 3-block chain incl. a migration (CPU, slow)
-make e2e-real   # end-to-end with a real STARK per block (very slow on CPU)
-make clippy     # lints, warnings are errors
+make image      # build the development image (Rust and the RISC Zero toolchain, linux/amd64)
+make test       # unit and integration tests with dev-mode receipts
+make clippy     # lints; warnings are errors
+make bins       # release binaries (linux/amd64) into ./bin
+make e2e        # three-node end-to-end test with dev-mode receipts
+make prove      # real STARKs for a three-block chain including a migration (CPU, hours)
+make e2e-real   # the end-to-end test with a real STARK for every block and migration (CPU, many hours)
 ```
 
-The dev image is `linux/amd64` because RISC Zero ships Linux toolchains for
-x86_64 only; on Apple Silicon it runs under Rosetta. Real proving inside that
-container is CPU-only. Base images are digest-pinned and the RISC Zero
-toolchain (cargo-risczero, r0vm, guest Rust) is version-pinned because the
-guest image IDs are part of the chain parameters: `bhss-snapshot` writes the
-IDs of the guests it was built with into `params.json`, and a node refuses a
-network whose IDs differ from its own binaries. So after any change to the
-guest code or the toolchain, regenerate the network with `bhss-snapshot`
-(`params.json` files from before the image IDs were added are rejected:
-unknown or missing fields are errors).
+The development image is `linux/amd64` because RISC Zero publishes Linux
+toolchains for x86_64 only. On Apple Silicon it runs under Rosetta. Proving
+in the container uses the CPU only.
 
-Build knobs (all optional, see `Makefile`): `JOBS` (cargo parallelism, default
-1 because linking the two ~170 MB binaries in parallel exhausts a shared 8 GB
-VM; raise it on a bigger machine), `RISC0_CXXFLAGS` (optimization level of RISC Zero's generated C++ prover
-kernels, default `-O1` so they compile inside an 8 GB Docker VM; use `-O3` on a
-larger machine for faster proving), `SEGMENT_PO2` (zkVM segment size, default
-17 through `make` and compose; 19 was OOM-killed in a shared 8 GB VM. The
-binaries themselves default to `--segment-po2 20` when run directly).
+Optional build settings (see `Makefile`):
 
-## Proving cost (measured)
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `JOBS` | 1 | cargo parallelism. Compiling the prover kernels or linking the large binaries in parallel exceeds the memory of an 8 GB Docker VM. |
+| `RISC0_CXXFLAGS` | `-O1` | optimization level of RISC Zero's generated C++ prover kernels. `-O3` proves faster but needs more than 4 GB per compiler process. |
+| `SEGMENT_PO2` | 17 | zkVM segment size as a power of two, used by `make prove`, `make e2e` and `make e2e-real`. Larger segments need more prover memory. |
 
-Measured on an M1 Pro running the amd64 image under Rosetta, 8 threads,
-`-O1` kernels, segment 2^17 (`cycles` as reported by the prover). `make
-prove`, 2026-10-12, with nothing else running in the 8 GB Docker VM:
+Run directly, `bhssd` and `bhss-cli migrate` default to `--segment-po2 20`
+and `--prove-mode dev`.
 
-| Proof | Guest cycles | Wall time | RAM |
-|-------|-------------:|----------:|----:|
+## Running a network
+
+A network is defined by two files that `bhss-snapshot` writes into a
+directory: `params.json` and `genesis_state.bin`.
+
+| Command | Result |
+|---------|--------|
+| `bhss-snapshot empty --out-dir DIR` | a network named `bhrt` with an empty genesis state |
+| `bhss-snapshot synthetic --out-dir DIR --coin TXID:VOUT:VALUE:SCRIPT_HEX …` | a network with the given legacy coins |
+| `bhss-snapshot from-dump --dump FILE --out-dir DIR [--require-real-proofs]` | a network named `bhsn` whose genesis state is a Bitcoin Core `dumptxoutset` file |
+
+`bhssd --params DIR/params.json --genesis-state DIR/genesis_state.bin`
+starts a node. Its other options are `--datadir` (default `data`),
+`--p2p-bind` (default `127.0.0.1:18555`), `--rpc-bind` (default
+`127.0.0.1:18443`), `--connect HOST:PORT` (repeatable), `--prove-mode`
+(`dev` or `real`) and `--segment-po2`. Blocks are produced only on request,
+through the `generate` RPC method.
+
+`bhss-cli --rpc URL` provides `keygen`, `address`, `balance`, `send`,
+`legacy-script`, `migrate` and `rpc`. `docker-compose.yml` and
+`tests/e2e.sh` show a complete three-node setup that runs these binaries in
+containers.
+
+## Proving cost
+
+All figures were measured on an Apple M1 Pro running the `linux/amd64`
+image under Rosetta with 8 threads, `-O1` prover kernels and an 8 GB Docker
+VM. Cycle counts are those reported by the prover. Succinct receipts were
+223 to 224 KB each.
+
+`make prove`, segments of 2¹⁷ cycles, no other load in the VM:
+
+| Proof | Guest cycles | Wall time | Memory |
+|-------|-------------:|----------:|-------:|
 | block, coinbase only | 1.74 M | ≈18 min | ≈1.5 GB |
 | migration receipt (P2WPKH, ECDSA inside the guest) | 0.52 M | ≈5 min | <1 GB |
-| block with one SLH-DSA spend + one composed migration | 11.4 M | ≈2.0 h | ≈1.7 GB |
+| block with one SLH-DSA spend and one composed migration | 11.4 M | ≈2.0 h | ≈1.7 GB |
 
-With other containers competing for the VM the same proofs took 25–28 min,
-≈7 min and ≈2.8 h. Receipts are 223–224 KB each (succinct).
+With other containers competing for the same VM, the same three proofs took
+25 to 28 minutes, about 7 minutes and about 2.8 hours.
 
-`make e2e-real`, 2026-10-11/12 (6 real block proofs and 7 real migration
-proofs, every check of the scenario passed):
+`make e2e-real`, segments of 2¹⁷ cycles, three node containers in the VM:
 
 | Proof | Guest cycles | Wall time |
 |-------|-------------:|----------:|
 | block, coinbase only | 1.74 M | 23–26 min |
 | block with one SLH-DSA spend | 8.9 M | 1.85 h |
-| migration receipts, one per template | 0.46–1.46 M | 6–17 min |
-| block with 7 migrations | 13.2 M | ≈11 h (segment 2^16) |
+| migration receipts, one per legacy template | 0.46–1.46 M | 6–17 min |
 
-The last row is not what the code does any more. That run still fed the
-migration receipts themselves (≈223 KB each) to the block guest, which
-costs about 1.6 M cycles of input decoding per migration; the prover now
-empties them (the guest needs only their number), without changing the
-guest. It was also proven with segment 2^16 after an out-of-memory kill,
-which doubles the number of recursion proofs. The run was interrupted
-twice (the OOM kill and a killed driver shell) and resumed from the nodes'
-disks; blocks 1–3 and the migration receipts were not redone.
+One measurement does not correspond to the current prover: a block with
+seven migrations took 13.2 M cycles and about 11 hours, with segments of
+2¹⁶ cycles and with a prover that passed the bytes of the seven migration
+receipts (about 223 KB each) into the block guest. The current prover
+passes only the number of receipts, which avoids decoding them in the
+guest (estimated at 1.6 M cycles per receipt). A block with seven
+migrations has not been measured in that configuration.
 
-One SLH-DSA-SHA2-128s verification therefore costs roughly 10 M cycles in the
-guest even with the SHA-256 accelerator, which is why the default block limit
-is 16 signature checks.
+From the tables, one SLH-DSA spend adds about 7 M cycles to a block
+(8.9 M against 1.74 M), even with the zkVM's SHA-256 accelerator. This is
+why the default limit is 16 signature checks per block; a block that uses
+the whole limit is on the order of 10⁸ cycles, which is an extrapolation
+and was not measured.
 
-Dev-mode execution of the same block takes ≈50 ms, which is what `make e2e`
-uses. **Dev mode proves nothing**: the receipts are RISC Zero fake receipts,
-so `make e2e` exercises the migration *logic* (wrong keys fail in the
-executor, forged receipts for the wrong image are rejected by nodes) but not
-the soundness of the STARK. A chain with `require_real_proofs = true` rejects
-fake receipts regardless of any environment variable. Real proving is a `make prove` / `make e2e-real` affair: `make prove`
-proves three blocks plus a composed migration receipt (hours on this setup);
-`make e2e-real` runs the same end-to-end scenario with a real STARK for every
-block and every migration; it shortens the coinbase maturity to 1
-(`E2E_MATURITY`) so that the chain is 7 blocks instead of 15, and still takes
-many hours on this setup; do not build or test in the same Docker VM while it
-runs, the prover gets OOM-killed (a GPU or a native x86_64 host with
-`RISC0_CXXFLAGS=-O3` is the practical way to run it).
+Dev mode executes the guest without proving it, which was measured at about
+50 ms for a block.
 
-## What the e2e test covers
+`make e2e-real` shortens the coinbase maturity to 1 (`E2E_MATURITY`), so
+that the scenario needs 7 blocks instead of 16. Do not build or run tests
+in the same Docker VM while a real proof is running: the prover is killed
+when the VM runs out of memory. A GPU prover or a native x86_64 host with
+`RISC0_CXXFLAGS=-O3` is the practical way to run real proofs.
 
-`tests/e2e.sh` starts three nodes in a line (node1 – node2 – node3), builds a
-synthetic snapshot with seven legacy coins (P2WPKH, uncompressed P2PKH, P2TR,
-P2SH-P2WPKH, P2PK, 2-of-3 P2WSH multisig, 1-of-2 P2SH multisig) and checks:
+## What the tests cover
 
-* blocks mined on node1 (each carrying a block receipt) sync to node3 with
-  identical state roots;
-* an SLH-DSA spend relayed through the network and confirmed;
-* a corrupted SLH-DSA signature is rejected with `SIG-2` (hidden CLI test
-  hook `send --corrupt-signature`);
-* every legacy template is migrated with a zkVM migration proof (fake in dev
-  mode, see above) submitted via node2 and mined by node1; a wrong key is
-  rejected by the executor and a forged receipt for the wrong image is
-  rejected by the node with `MIG-2` (hidden CLI test hook
-  `migrate --forge-receipt`);
-* all nodes report the same guest image IDs, which are pinned in
-  `params.json`;
-* a network partition where node3 mines the longer chain and node1 reorganizes;
-* node restart with full re-validation from disk.
+`tests/e2e.sh` starts three nodes connected in a line (node1, node2,
+node3), builds a synthetic genesis state with seven legacy coins (P2WPKH,
+uncompressed P2PKH, P2TR, P2SH-P2WPKH, P2PK, 2-of-3 P2WSH multisig and
+1-of-2 P2SH multisig) and checks that:
 
-The e2e chain is short (15 blocks). The behaviours it cannot reach — forks
-on chains longer than one download window, side-chain storage and eviction,
-mempool policy across reorganizations — are covered by unit tests in
-`crates/bhss-node` (`chain.rs`, `p2p.rs`), which build blocks in memory with
-forged dev-mode receipts.
+* the nodes agree on the genesis hash and the parameter hash, and each
+  reports the guest image IDs pinned in `params.json`;
+* blocks mined on node1, each with a block receipt, reach node3, and the
+  nodes agree on the state root;
+* an SLH-DSA spend submitted to node1 is mined and visible on node3;
+* a transaction with a corrupted SLH-DSA signature is rejected with
+  `SIG-2` (hidden test option `send --corrupt-signature`);
+* a migration with the right journal but a receipt for the wrong image is
+  rejected (hidden test option `migrate --forge-receipt`): with `MIG-2` in
+  dev mode, and by the mempool policy against fake receipts when the nodes
+  prove for real;
+* every legacy template is migrated with a zkVM migration receipt,
+  submitted through node2 and mined by node1, and a migration attempted
+  with the wrong key fails in the guest before any receipt exists;
+* after a partition in which node3 mines the longer branch, node1
+  reorganizes to it;
+* a restarted node re-validates its stored chain and reaches the same tip.
 
-## Review status
+In dev mode the receipts are fake, so `make e2e` exercises the migration
+logic but not the soundness of the STARK. `make e2e-real` proves every
+block and migration for real; its network still has
+`require_real_proofs = false`, so it does not test that consensus rejects
+fake receipts. `make prove` proves three blocks and a composed migration
+receipt and verifies them with fake receipts disallowed.
 
-`docs/DECISIONS.md` has the log of the adversarial self-review (what was
-found, what was changed) and the list of known limitations that were left
-as they are on purpose.
+The end-to-end chain is short (height 15 in dev mode). Behaviour it cannot
+reach, such as forks on chains longer than one download window of 32
+blocks, storage and eviction of competing-branch blocks, and mempool policy
+across reorganizations, is covered by unit tests in `crates/bhss-node`
+(`chain.rs`, `p2p.rs`), which build blocks in memory with dev-mode
+receipts. The consensus rules are tested rule by rule in
+`crates/bhss-consensus/tests/rules.rs`.
+
+Known limitations are listed in
+[`docs/DECISIONS.md`](docs/DECISIONS.md#9-limitations-and-non-goals).

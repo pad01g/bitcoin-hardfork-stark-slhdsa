@@ -19,7 +19,7 @@ exclude = ["crates/bhss-methods/guest"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pad01g/bhss"
+repository = "https://github.com/pad01g/bitcoin-hardfork-stark-slhdsa"
 
 [workspace.dependencies]
 bhss-primitives = { path = "crates/bhss-primitives", default-features = false }

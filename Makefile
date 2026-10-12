@@ -14,8 +14,8 @@ JOBS       ?= 1
 # per compiler at -O3; -O1 fits in a shared 8 GB VM (slower proving, same
 # results). Override with RISC0_CXXFLAGS=-O3 on a big machine.
 RISC0_CXXFLAGS ?= -O1
-# zkVM segment size (power of two). 2^17 keeps the CPU prover under ~1.6 GB;
-# 2^19 was OOM-killed in a shared 8 GB VM.
+# zkVM segment size (power of two). 2^17 keeps the CPU prover under about
+# 2 GB; 2^19 needs more memory than a shared 8 GB VM provides.
 SEGMENT_PO2 ?= 17
 
 DOCKER_RUN = docker run --rm --platform $(PLATFORM) \
