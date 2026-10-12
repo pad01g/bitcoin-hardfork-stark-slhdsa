@@ -15,6 +15,11 @@ pub enum StateError {
     AlreadyExists,
     /// STATE-2: witness ran out of proofs / proof malformed.
     BadProof,
+    /// STATE-2: the proof does not reproduce the current root for the
+    /// claimed leaf. For a stateless verifier this is indistinguishable from
+    /// STATE-3/STATE-4; a stateful verifier checks its own set first and
+    /// therefore knows the witness itself is wrong.
+    ProofMismatch,
 }
 
 /// A mutable view of the UTXO commitment.
@@ -51,11 +56,11 @@ impl<'a> ProofBackedState<'a> {
         self.next += 1;
         Ok(p)
     }
-    fn transition(&mut self, key: &Hash32, from: &Hash32, to: &Hash32, mismatch: StateError) -> Result<(), StateError> {
+    fn transition(&mut self, key: &Hash32, from: &Hash32, to: &Hash32) -> Result<(), StateError> {
         let proof = self.take()?;
         let cur = compute_root(&self.empty, key, from, proof).map_err(|_| StateError::BadProof)?;
         if cur != self.root {
-            return Err(mismatch);
+            return Err(StateError::ProofMismatch);
         }
         self.root = compute_root(&self.empty, key, to, proof).map_err(|_| StateError::BadProof)?;
         Ok(())
@@ -69,12 +74,12 @@ impl StateView for ProofBackedState<'_> {
     fn spend(&mut self, outpoint: &OutPoint, coin: &Coin) -> Result<(), StateError> {
         let key = outpoint.smt_key();
         let leaf = coin.leaf_hash();
-        self.transition(&key, &leaf, &EMPTY_LEAF, StateError::MissingOrMismatch)
+        self.transition(&key, &leaf, &EMPTY_LEAF)
     }
     fn create(&mut self, outpoint: &OutPoint, coin: &Coin) -> Result<(), StateError> {
         let key = outpoint.smt_key();
         let leaf = coin.leaf_hash();
-        self.transition(&key, &EMPTY_LEAF, &leaf, StateError::AlreadyExists)
+        self.transition(&key, &EMPTY_LEAF, &leaf)
     }
 }
 
@@ -119,9 +124,12 @@ impl FullState {
         self.record.take().unwrap_or_default()
     }
     fn record_proof(&mut self, key: &Hash32) {
-        if self.record.is_some() {
-            let p = self.smt.prove(key);
-            self.record.as_mut().unwrap().push(p);
+        if self.record.is_none() {
+            return;
+        }
+        let p = self.smt.prove(key);
+        if let Some(r) = self.record.as_mut() {
+            r.push(p);
         }
     }
 }
@@ -165,12 +173,19 @@ impl StateView for DualState<'_> {
         self.full.root()
     }
     fn spend(&mut self, outpoint: &OutPoint, coin: &Coin) -> Result<(), StateError> {
+        // The full set decides STATE-3; only then is the witness proof judged.
+        if self.full.get(outpoint) != Some(coin) {
+            return Err(StateError::MissingOrMismatch);
+        }
         self.proofs.spend(outpoint, coin)?;
         self.full.spend(outpoint, coin)?;
         debug_assert_eq!(self.proofs.root(), self.full.root());
         Ok(())
     }
     fn create(&mut self, outpoint: &OutPoint, coin: &Coin) -> Result<(), StateError> {
+        if self.full.get(outpoint).is_some() {
+            return Err(StateError::AlreadyExists);
+        }
         self.proofs.create(outpoint, coin)?;
         self.full.create(outpoint, coin)?;
         debug_assert_eq!(self.proofs.root(), self.full.root());

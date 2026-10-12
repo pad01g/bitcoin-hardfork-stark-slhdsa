@@ -22,3 +22,18 @@ crypto-bigint = { git = "https://github.com/risc0/RustCrypto-crypto-bigint", tag
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# Same safety net as the host workspace: an overflow in consensus code makes
+# the guest panic (unprovable block) instead of wrapping.
+[profile.release.package.bhss-primitives]
+overflow-checks = true
+[profile.release.package.bhss-smt]
+overflow-checks = true
+[profile.release.package.bhss-consensus]
+overflow-checks = true
+[profile.release.package.bhss-legacy]
+overflow-checks = true
+[profile.release.package.bhss-slhdsa]
+overflow-checks = true
+[profile.release.package.bhss-guest]
+overflow-checks = true

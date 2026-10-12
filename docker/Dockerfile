@@ -1,20 +1,28 @@
 # BHSS build/test image. linux/amd64 on purpose: RISC Zero ships prebuilt
 # Linux toolchains for x86_64 only. On Apple Silicon this runs under Rosetta.
-FROM --platform=linux/amd64 rust:1.98.1-bookworm
+FROM --platform=linux/amd64 rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential clang pkg-config libssl-dev curl git ca-certificates \
         jq python3 \
     && rm -rf /var/lib/apt/lists/*
+RUN rustup component add clippy rustfmt
 
-# RISC Zero toolchain manager. Versions are pinned below; bump deliberately.
+# RISC Zero toolchain manager. Every component is pinned (the guest compiler
+# version changes the guest image IDs, which are consensus — PAR-5); bump
+# deliberately and regenerate params.json afterwards.
 ARG RISC0_VERSION=3.0.6
+ARG RISC0_RUST_VERSION=1.97.0
+ARG RZUP_VERSION=0.5.0
 ENV RISC0_HOME=/root/.risc0
 ENV PATH=/root/.risc0/bin:$PATH
-RUN curl -L https://risczero.com/install | bash \
+RUN curl -fL --retry 5 -o /tmp/rzup-install.sh https://risczero.com/install \
+    && bash /tmp/rzup-install.sh \
+    && rm /tmp/rzup-install.sh \
+    && rzup --version | grep -q "rzup ${RZUP_VERSION}" \
     && rzup install cargo-risczero ${RISC0_VERSION} \
     && rzup install r0vm ${RISC0_VERSION} \
-    && rzup install rust \
+    && rzup install rust ${RISC0_RUST_VERSION} \
     && rzup show
 
 # risc0-circuit-recursion's build script downloads this archive and verifies

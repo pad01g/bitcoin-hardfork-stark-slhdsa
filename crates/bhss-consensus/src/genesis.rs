@@ -1,4 +1,5 @@
-//! GEN-1..GEN-4: the genesis block is a pure function of the chain params.
+//! GEN-1, GEN-2, GEN-5: the genesis block is a pure function of the chain
+//! params. (Importing a snapshot, GEN-3/GEN-4, lives in `bhss-snapshot`.)
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -31,7 +32,7 @@ pub fn genesis_block(params: &ChainParams) -> Block {
     };
     let target = params.target();
     while !hash_meets_target(&header.hash(), &target) {
-        header.nonce += 1;
+        header.nonce = header.nonce.checked_add(1).expect("genesis nonce space exhausted: params.pow_bits unsatisfiable (PAR-4)");
     }
     Block { header, txs: vec![coinbase], witness: BlockWitness::default(), receipt: Vec::new() }
 }
@@ -42,7 +43,7 @@ pub fn genesis_prev_state(params: &ChainParams) -> (Hash32, PrevState) {
     (hash, PrevState { height: 0, hash, state_root: params.genesis_state_root, time: g.header.time })
 }
 
-/// GEN-2: `H(0x0C || enc(sorted coins))`, and the SMT root of those coins.
+/// GEN-2: the SMT root of the genesis coins (order-independent).
 pub fn genesis_state_root(coins: &[(OutPoint, Coin)]) -> Hash32 {
     let mut smt = bhss_smt::Smt::new();
     for (op, coin) in coins {

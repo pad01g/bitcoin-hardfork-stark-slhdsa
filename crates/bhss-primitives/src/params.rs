@@ -9,6 +9,7 @@ use crate::hash::{tagged_hash, Hash32, Tag};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct ChainParams {
     /// Human readable network name, also the bech32m HRP (e.g. "bhrt").
     pub name: String,
@@ -18,7 +19,7 @@ pub struct ChainParams {
     pub max_sig_checks: u32,
     /// BLK-9: max migration (legacy) inputs per block.
     pub max_migrations: u32,
-    /// CB-4.
+    /// IN-2 (coins created by a coinbase, CB-4).
     pub coinbase_maturity: u32,
     /// CB-3.
     pub subsidy_halving_interval: u32,
@@ -31,6 +32,12 @@ pub struct ChainParams {
     pub genesis_state_root: Hash32,
     /// PRF-5: if false, RISC Zero dev-mode (fake) receipts are accepted.
     pub require_real_proofs: bool,
+    /// PAR-5 / PRF-1: image ID of the block guest every receipt must verify for.
+    #[cfg_attr(feature = "serde", serde(with = "crate::hash::serde_hex32"))]
+    pub block_image_id: Hash32,
+    /// PAR-5 / MIG-2: image ID of the migration guest.
+    #[cfg_attr(feature = "serde", serde(with = "crate::hash::serde_hex32"))]
+    pub migrate_image_id: Hash32,
 }
 
 impl ChainParams {
@@ -40,7 +47,8 @@ impl ChainParams {
     }
 
     /// Defaults for the regtest network (`bhrt`). The genesis state root is
-    /// filled in by whoever builds the genesis state.
+    /// filled in by whoever builds the genesis state; the guest image IDs
+    /// are zero until `with_images` (a node refuses zero IDs, PAR-5).
     pub fn regtest(genesis_state_root: Hash32) -> Self {
         Self {
             name: String::from("bhrt"),
@@ -54,12 +62,45 @@ impl ChainParams {
             genesis_time: 1_760_000_000,
             genesis_state_root,
             require_real_proofs: false,
+            block_image_id: [0u8; 32],
+            migrate_image_id: [0u8; 32],
         }
+    }
+
+    /// Same, with the guest image IDs filled in (PAR-5).
+    pub fn with_images(mut self, block_image_id: Hash32, migrate_image_id: Hash32) -> Self {
+        self.block_image_id = block_image_id;
+        self.migrate_image_id = migrate_image_id;
+        self
+    }
+
+    /// PAR-4: reject parameter sets the rules cannot operate on.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        // The name is also the bech32m HRP (PAR-3).
+        if self.name.is_empty() || self.name.len() > 83 || !self.name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            return Err("PAR-4: name must be 1..=83 characters of [a-z0-9]");
+        }
+        if self.subsidy_halving_interval == 0 {
+            return Err("PAR-4: subsidy_halving_interval must be > 0");
+        }
+        if self.max_block_tx_bytes == 0 || self.max_sig_checks == 0 {
+            return Err("PAR-4: block limits must be > 0");
+        }
+        if self.initial_subsidy > crate::types::MAX_MONEY {
+            return Err("PAR-4: initial_subsidy > MAX_MONEY");
+        }
+        if self.target() == [0u8; 32] {
+            return Err("PAR-4: target is zero (unsatisfiable)");
+        }
+        if (self.pow_bits >> 24) > 32 {
+            return Err("PAR-4: pow_bits exponent overflows 256 bits");
+        }
+        Ok(())
     }
 
     /// CB-3.
     pub fn subsidy(&self, height: u32) -> u64 {
-        let halvings = height / self.subsidy_halving_interval;
+        let halvings = height / self.subsidy_halving_interval.max(1);
         if halvings >= 64 {
             0
         } else {
@@ -112,7 +153,9 @@ impl Encode for ChainParams {
             .u32(self.pow_bits)
             .u32(self.genesis_time)
             .raw(&self.genesis_state_root)
-            .bool(self.require_real_proofs);
+            .bool(self.require_real_proofs)
+            .raw(&self.block_image_id)
+            .raw(&self.migrate_image_id);
     }
 }
 impl Decode for ChainParams {
@@ -131,6 +174,57 @@ impl Decode for ChainParams {
             genesis_time: d.u32()?,
             genesis_state_root: d.array()?,
             require_real_proofs: d.bool()?,
+            block_image_id: d.array()?,
+            migrate_image_id: d.array()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(s, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn compact_target_vectors() {
+        // Bitcoin main-net genesis difficulty.
+        assert_eq!(compact_to_target(0x1d00ffff), hex32("00000000ffff0000000000000000000000000000000000000000000000000000"));
+        // Regtest.
+        assert_eq!(compact_to_target(0x207fffff), hex32("7fffff0000000000000000000000000000000000000000000000000000000000"));
+        // Small exponents place the mantissa at the low end.
+        assert_eq!(compact_to_target(0x03123456), hex32("0000000000000000000000000000000000000000000000000000000000123456"));
+        assert_eq!(compact_to_target(0x01123456), hex32("0000000000000000000000000000000000000000000000000000000000000012"));
+        assert!(hash_meets_target(&[0u8; 32], &compact_to_target(0x1d00ffff)));
+        assert!(!hash_meets_target(&[0xffu8; 32], &compact_to_target(0x207fffff)));
+    }
+
+    #[test]
+    fn params_validation() {
+        let p = ChainParams::regtest([0u8; 32]);
+        assert!(p.validate().is_ok());
+        let mut bad = p.clone();
+        bad.subsidy_halving_interval = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = p.clone();
+        bad.pow_bits = 0x2100ffff; // exponent 33
+        assert!(bad.validate().is_err());
+        let mut bad = p.clone();
+        bad.pow_bits = 0x03000000; // zero target
+        assert!(bad.validate().is_err());
+        let mut bad = p.clone();
+        bad.name = String::new();
+        assert!(bad.validate().is_err());
+        let mut bad = p.clone();
+        bad.name = String::from("Bhrt");
+        assert!(bad.validate().is_err());
+        // The image ids are part of the parameter hash (PAR-5).
+        let with = p.clone().with_images([1u8; 32], [2u8; 32]);
+        assert_ne!(with.hash(), p.hash());
+        assert_eq!(ChainParams::from_bytes(&with.to_bytes()).unwrap(), with);
     }
 }

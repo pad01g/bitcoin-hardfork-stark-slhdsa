@@ -49,6 +49,12 @@ enum Cmd {
     },
 }
 
+/// Regtest defaults pinned to the guest images this binary was built with
+/// (PAR-5). Nodes built from other guest code refuse the resulting network.
+fn base_params() -> ChainParams {
+    ChainParams::regtest([0u8; 32]).with_images(bhss_methods::block_image_id(), bhss_methods::migrate_image_id())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::FromDump { dump, out_dir, name, require_real_proofs } => {
@@ -62,14 +68,14 @@ fn main() -> Result<()> {
                 info.imported,
                 info.skipped
             );
-            let mut params = ChainParams::regtest([0u8; 32]);
+            let mut params = base_params();
             params.name = name;
             params.require_real_proofs = require_real_proofs;
             write_network(&out_dir, params, &coins)?;
             println!("{}", hex::encode(genesis_state_root(&coins)));
         }
         Cmd::Empty { out_dir, name } => {
-            let mut params = ChainParams::regtest([0u8; 32]);
+            let mut params = base_params();
             params.name = name;
             write_network(&out_dir, params, &Vec::new())?;
             println!("{}", hex::encode(genesis_state_root(&Vec::new())));
@@ -86,7 +92,7 @@ fn main() -> Result<()> {
                 let coin = legacy_coin(value, script).context("unspendable script")?;
                 genesis.push((OutPoint::new(txid, vout), coin));
             }
-            let mut params = ChainParams::regtest([0u8; 32]);
+            let mut params = base_params();
             params.name = name;
             write_network(&out_dir, params, &genesis)?;
             println!("{}", hex::encode(genesis_state_root(&genesis)));

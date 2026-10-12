@@ -10,9 +10,6 @@ bhss-primitives = { workspace = true }
 bhss-smt = { workspace = true }
 bhss-slhdsa = { workspace = true }
 
-[dev-dependencies]
-bhss-smt = { workspace = true }
-
 [features]
 default = ["std"]
 std = ["bhss-primitives/std", "bhss-smt/std", "bhss-slhdsa/std"]

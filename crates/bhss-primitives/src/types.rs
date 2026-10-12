@@ -16,6 +16,12 @@ pub const SLH_SIG_LEN: usize = 7856;
 pub const MAX_MULTISIG_KEYS: usize = 16;
 pub const MAX_DATA_LEN: usize = 1024;
 pub const MAX_LEGACY_SCRIPT_LEN: usize = 10_000;
+/// PRF-7: upper bound on one serialized receipt (block receipt or a
+/// migration receipt in `Transaction::proofs`). Succinct receipts are ~250 KB.
+pub const MAX_RECEIPT_LEN: usize = 1 << 20;
+/// BLK-12: upper bound on the full encoding of a block (header, transactions
+/// with proofs, witness and receipt).
+pub const MAX_BLOCK_LEN: usize = 32 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -97,7 +103,11 @@ impl OutputKind {
         match self {
             OutputKind::P2pkSlh { .. } => true,
             OutputKind::MultisigSlh { k, pkhs } => {
-                *k >= 1 && (*k as usize) <= pkhs.len() && pkhs.len() <= MAX_MULTISIG_KEYS
+                *k >= 1
+                    && (*k as usize) <= pkhs.len()
+                    && pkhs.len() <= MAX_MULTISIG_KEYS
+                    // OUT-2: pairwise distinct, otherwise k-of-n degrades to fewer keys.
+                    && !pkhs.iter().enumerate().any(|(i, a)| pkhs[..i].contains(a))
             }
             OutputKind::Timelock { abs_height, rel_blocks, inner } => {
                 (*abs_height > 0 || *rel_blocks > 0)
@@ -134,6 +144,20 @@ impl Encode for OutputKind {
         }
     }
 }
+impl OutputKind {
+    /// The kinds allowed inside a `Timelock` (OUT-3). Decoding them here,
+    /// without recursion, makes nesting impossible at the encoding level
+    /// (a nested `0x02` is an invalid tag) and keeps the decoder's stack
+    /// usage constant regardless of input.
+    fn decode_slh_condition(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(match d.u8()? {
+            0x00 => OutputKind::P2pkSlh { pkh: d.array()? },
+            0x01 => OutputKind::MultisigSlh { k: d.u8()?, pkhs: d.vec()? },
+            t => return Err(DecodeError::InvalidTag(t)),
+        })
+    }
+}
+
 impl Decode for OutputKind {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(match d.u8()? {
@@ -142,7 +166,7 @@ impl Decode for OutputKind {
             0x02 => OutputKind::Timelock {
                 abs_height: d.u32()?,
                 rel_blocks: d.u32()?,
-                inner: Box::new(OutputKind::decode(d)?),
+                inner: Box::new(OutputKind::decode_slh_condition(d)?),
             },
             0x03 => OutputKind::Data { data: d.bytes()? },
             0x04 => OutputKind::Legacy { script_pubkey: d.bytes()? },
@@ -197,7 +221,7 @@ impl Decode for Coin {
     }
 }
 
-/// One SLH-DSA signer in a witness (WIT-2).
+/// One SLH-DSA signer in a witness (§5 `Signer`).
 #[derive(Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SlhSigner {
@@ -230,7 +254,7 @@ mod serde_sig {
     }
 }
 
-/// WIT-1. Witness data is committed through `witness_hash` (TX-4) but is not
+/// §5 `Witness`. Witness data is committed through `witness_hash` (TX-4) but is not
 /// part of the txid.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -335,7 +359,8 @@ impl Transaction {
     pub fn is_coinbase(&self) -> bool {
         self.inputs.len() == 1 && matches!(self.inputs[0].witness, Witness::Coinbase)
     }
-    /// Encoding without `proofs` (used for block size accounting, BLK-7).
+    /// TX-10: length of the encoding without the `proofs` field (used for
+    /// block size accounting, BLK-7).
     pub fn committed_size(&self) -> usize {
         let mut e = Encoder::new();
         self.encode_committed(&mut e);
@@ -532,8 +557,12 @@ impl Decode for Block {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlockJournal {
     pub params_hash: Hash32,
+    /// GEN-5: binds the network the signatures inside the block were made for.
+    pub genesis_hash: Hash32,
     pub height: u32,
     pub block_hash: Hash32,
+    /// Parent header `time` the guest checked HDR-7 against.
+    pub prev_time: u32,
     pub root_prev: Hash32,
     pub root_next: Hash32,
     /// Image ID of the migration guest the block guest accepted assumptions from.
@@ -543,8 +572,10 @@ pub struct BlockJournal {
 impl Encode for BlockJournal {
     fn encode(&self, e: &mut Encoder) {
         e.raw(&self.params_hash)
+            .raw(&self.genesis_hash)
             .u32(self.height)
             .raw(&self.block_hash)
+            .u32(self.prev_time)
             .raw(&self.root_prev)
             .raw(&self.root_next)
             .raw(&self.migrate_image_id);
@@ -554,8 +585,10 @@ impl Decode for BlockJournal {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(Self {
             params_hash: d.array()?,
+            genesis_hash: d.array()?,
             height: d.u32()?,
             block_hash: d.array()?,
+            prev_time: d.u32()?,
             root_prev: d.array()?,
             root_next: d.array()?,
             migrate_image_id: d.array()?,

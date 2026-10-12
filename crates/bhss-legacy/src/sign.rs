@@ -156,6 +156,27 @@ mod tests {
         let ms = script_multisig(2, &[compressed_pubkey(&k1), compressed_pubkey(&k2), compressed_pubkey(&k3)]);
         assert!(verify_migration(&script_p2wsh_of(&ms), &m, &auth_multisig(&ms, &[&k1, &k3], &m)));
         assert!(verify_migration(&script_p2sh_of(&ms), &m, &auth_multisig(&ms, &[&k2, &k3], &m)));
+        // CRYPTO-4: the high-S twin (r, n - s) of a signature is accepted too.
+        let low: [u8; 64] = ecdsa_sign(&k1, &m);
+        let sig = k256::ecdsa::Signature::from_slice(&low).unwrap();
+        let (r, s) = sig.split_scalars();
+        let high = k256::ecdsa::Signature::from_scalars(r, -*s).unwrap();
+        assert!(high.normalize_s().is_some(), "twin is high-S");
+        let high: [u8; 64] = high.to_bytes().into();
+        assert_ne!(high, low);
+        assert!(verify_migration(&script_p2wpkh(&pk1), &m, &MigrationAuth::KeyHash { pubkey: pk1.clone(), sig: high }));
+        // Hybrid public keys (0x06/0x07) are not recognised.
+        let mut hybrid = uncompressed_pubkey(&k1);
+        hybrid[0] = 0x06 | (hybrid[64] & 1);
+        assert!(!verify_migration(&script_p2pkh(&hybrid), &m, &MigrationAuth::KeyHash { pubkey: hybrid.clone(), sig: low }));
+        // Neither is the SEC1 "compact" form (0x05 || x), in P2PK or P2PKH.
+        let mut compact = pk1.clone();
+        compact[0] = 0x05;
+        assert!(!verify_migration(&script_p2pk(&compact), &m, &MigrationAuth::PubKey { sig: low }));
+        assert!(!verify_migration(&script_p2pkh(&compact), &m, &MigrationAuth::KeyHash { pubkey: compact.clone(), sig: low }));
+        // P2WPKH requires a compressed key.
+        let unc = uncompressed_pubkey(&k1);
+        assert!(!verify_migration(&script_p2wpkh(&unc), &m, &MigrationAuth::KeyHash { pubkey: unc.clone(), sig: low }));
         // wrong order fails (CHECKMULTISIG semantics)
         assert!(!verify_migration(&script_p2wsh_of(&ms), &m, &auth_multisig(&ms, &[&k3, &k1], &m)));
         assert!(!verify_migration(&script_p2wsh_of(&ms), &m, &auth_multisig(&ms, &[&k1], &m)));

@@ -484,8 +484,6 @@ name = "bhss-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bech32",
- "bhss-consensus",
  "bhss-legacy",
  "bhss-primitives",
  "bhss-prover",
@@ -532,12 +530,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "bech32",
  "bhss-consensus",
  "bhss-primitives",
  "bhss-prover",
  "bhss-slhdsa",
- "bhss-smt",
  "bhss-snapshot",
  "clap",
  "hex",
@@ -598,7 +594,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bhss-consensus",
- "bhss-legacy",
+ "bhss-methods",
  "bhss-primitives",
  "clap",
  "hex",

@@ -60,5 +60,38 @@ getrandom = "0.2"
 debug = 1
 lto = "thin"
 
+# Consensus and node code must never wrap silently: integer overflow in
+# release builds aborts instead (every rule uses checked arithmetic, this is
+# the safety net). Third-party crates keep the default.
+[profile.release.package.bhss-primitives]
+overflow-checks = true
+
+[profile.release.package.bhss-smt]
+overflow-checks = true
+
+[profile.release.package.bhss-consensus]
+overflow-checks = true
+
+[profile.release.package.bhss-legacy]
+overflow-checks = true
+
+[profile.release.package.bhss-slhdsa]
+overflow-checks = true
+
+[profile.release.package.bhss-prover]
+overflow-checks = true
+
+[profile.release.package.bhss-node]
+overflow-checks = true
+
+[profile.release.package.bhss-cli]
+overflow-checks = true
+
+[profile.release.package.bhss-snapshot]
+overflow-checks = true
+
+[profile.release.package.bhss-methods]
+overflow-checks = true
+
 [patch.crates-io]
 slh-dsa = { path = "vendor/slh-dsa" }

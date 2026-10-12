@@ -14,13 +14,17 @@ RPC3=http://127.0.0.1:18445
 # The CLI runs inside the compose network, so it addresses nodes by service name.
 CRPC1=http://node1:18443
 CRPC2=http://node2:18443
-MATURITY=10
+# E2E_MATURITY=1 keeps a real-proof run (PROVE_MODE=real) to 7 blocks.
+MATURITY="${E2E_MATURITY:-10}"
 
 log() { printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
-die() { printf '\033[1;31mFAIL: %s\033[0m\n' "$*"; docker compose logs --tail=40; docker compose down -v >/dev/null 2>&1 || true; exit 1; }
+PASSED=0
+cleanup() { if [ "$PASSED" != 1 ]; then docker compose logs --tail=40 || true; fi; docker compose down -v >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+die() { printf '\033[1;31mFAIL: %s\033[0m\n' "$*"; exit 1; }
 rpc() { # rpc URL method [json params]
   local url=$1 method=$2 params=${3:-[]}
-  curl -sS --max-time 7200 -H 'content-type: application/json' \
+  curl -sS --max-time 43200 -H 'content-type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" "$url"
 }
 rpcr() { local out; out=$(rpc "$@"); if [ "$(echo "$out" | jq -r '.error')" != "null" ]; then echo "rpc error: $(echo "$out" | jq -c .error)" >&2; return 1; fi; echo "$out" | jq -r '.result'; }
@@ -31,6 +35,9 @@ wait_height() { # url height
   die "$1 did not reach height $2 (at $h)"
 }
 assert_eq() { if [ "$1" != "$2" ]; then die "$3: expected '$2' got '$1'"; fi; }
+gen() { # gen URL count address: one block per call (a real proof can take hours)
+  local i; for i in $(seq 1 "$2"); do rpcr "$1" generate "[1, \"$3\"]" | jq -c .; done
+}
 
 log "cleanup"
 docker compose down -v >/dev/null 2>&1 || true
@@ -68,6 +75,13 @@ wait_rpc $RPC1; wait_rpc $RPC2; wait_rpc $RPC3
 G1=$(rpcr $RPC1 getblockchaininfo | jq -r .genesis_hash); G3=$(rpcr $RPC3 getblockchaininfo | jq -r .genesis_hash)
 assert_eq "$G1" "$G3" "genesis hash"
 assert_eq "$(rpcr $RPC1 getblockchaininfo | jq -r .utxos)" "7" "genesis utxo count"
+# PAR-5: the guest image IDs in params.json are the ones every node runs.
+BID=$(jq -r .block_image_id "$E2E/net/params.json"); MID=$(jq -r .migrate_image_id "$E2E/net/params.json")
+for u in $RPC1 $RPC2 $RPC3; do
+  assert_eq "$(rpcr $u getblockchaininfo | jq -r .block_image_id)" "$BID" "block image id on $u"
+  assert_eq "$(rpcr $u getblockchaininfo | jq -r .migrate_image_id)" "$MID" "migrate image id on $u"
+done
+assert_eq "$(rpcr $RPC1 getblockchaininfo | jq -r .params_hash)" "$(rpcr $RPC3 getblockchaininfo | jq -r .params_hash)" "params hash"
 
 log "wallets"
 cli $CRPC1 keygen --out /wallet/alice.json --seed alice >/dev/null
@@ -76,20 +90,20 @@ ALICE=$(cli $CRPC1 address --key /wallet/alice.json); BOB=$(cli $CRPC1 address -
 echo "alice=$ALICE bob=$BOB"
 
 log "mine $((MATURITY+1)) blocks on node1 (each with a block proof)"
-rpcr $RPC1 generate "[$((MATURITY+1)), \"$ALICE\"]" | jq -c .
+gen $RPC1 $((MATURITY+1)) "$ALICE"
 wait_height $RPC3 $((MATURITY+1))
 assert_eq "$(rpcr $RPC3 getbestblockhash)" "$(rpcr $RPC1 getbestblockhash)" "node3 synced tip"
 assert_eq "$(rpcr $RPC2 getblockchaininfo | jq -r .state_root)" "$(rpcr $RPC1 getblockchaininfo | jq -r .state_root)" "state root"
 B1=$(rpcr $RPC1 getblock "[\"$(rpcr $RPC1 getblockhash '[1]')\"]")
 echo "$B1" | jq -c '{height, receipt_kind, receipt_bytes, witness_proofs}'
-if [ "$PROVE_MODE" = real ]; then assert_eq "$(echo "$B1" | jq -r .receipt_kind)" "stark" "real receipt"; else assert_eq "$(echo "$B1" | jq -r .receipt_kind)" "fake" "dev receipt"; fi
+if [ "$PROVE_MODE" = real ]; then assert_eq "$(echo "$B1" | jq -r .receipt_kind)" "succinct" "real receipt"; else assert_eq "$(echo "$B1" | jq -r .receipt_kind)" "fake" "dev receipt"; fi
 assert_eq "$(cli $CRPC1 balance --address "$ALICE")" "10000000000" "alice spendable balance (coinbases 1 and 2 mature at tip $((MATURITY+1)))"
 
 log "SLH-DSA spend alice -> bob via node1, mined on node1, observed on node3"
 TXID=$(cli $CRPC1 send --key /wallet/alice.json --to "$BOB" --amount 1234567 --fee 1000)
 echo "txid=$TXID"
 assert_eq "$(rpcr $RPC1 getrawmempool | jq -r length)" "1" "mempool size"
-rpcr $RPC1 generate "[1, \"$ALICE\"]" >/dev/null
+gen $RPC1 1 "$ALICE" >/dev/null
 wait_height $RPC3 $((MATURITY+2))
 assert_eq "$(rpcr $RPC3 getbalance "[\"$BOB\"]")" "1234567" "bob balance on node3"
 assert_eq "$(rpcr $RPC3 getrawtransaction "[\"$TXID\"]" | jq -r .height)" "$((MATURITY+2))" "tx confirmed height"
@@ -99,6 +113,14 @@ set +e; ERR=$(cli $CRPC1 send --key /wallet/alice.json --to "$BOB" --amount 1 --
 [ $RC -ne 0 ] || die "corrupted tx was accepted"
 echo "rejected with: $(echo "$ERR" | tail -1)"
 case "$ERR" in *SIG-2*) ;; *) die "bad tx not rejected with SIG-2: $ERR";; esac
+
+log "forged receipt (right journal, wrong image id) is rejected by the node"
+set +e; OUT=$(cli $CRPC2 migrate --prove-mode "$PROVE_MODE" --to "$BOB" --kind p2wpkh --legacy-key "$K1" --txid "$TX_P2WPKH" --vout 0 --forge-receipt 2>&1); RC=$?; set -e
+[ $RC -ne 0 ] || die "forged migration receipt was accepted"
+# A node that mines real proofs turns fake receipts away before MIG-2 is reached.
+if [ "$PROVE_MODE" = real ]; then WANT="dev-mode (fake) migration receipts"; else WANT="MIG-2"; fi
+case "$OUT" in *"$WANT"*) ;; *) die "forged receipt not rejected with '$WANT': $OUT";; esac
+echo "rejected with: $(echo "$OUT" | tail -1)"
 
 log "legacy migrations (zkVM-proven secp256k1 authorizations), submitted via node2"
 MIG() { cli $CRPC2 migrate --prove-mode "$PROVE_MODE" --segment-po2 "${SEGMENT_PO2:-17}" --to "$BOB" "$@"; }
@@ -118,7 +140,7 @@ set +e; OUT=$(cli $CRPC2 migrate --prove-mode "$PROVE_MODE" --to "$BOB" --kind p
 [ $RC -ne 0 ] || die "migration with wrong key succeeded"
 echo "rejected: $(echo "$OUT" | tail -1)"
 
-rpcr $RPC1 generate "[1, \"$ALICE\"]" >/dev/null
+gen $RPC1 1 "$ALICE" >/dev/null
 wait_height $RPC3 $((MATURITY+3))
 LAST=$(rpcr $RPC3 getblock "[\"$(rpcr $RPC3 getbestblockhash)\"]")
 assert_eq "$(echo "$LAST" | jq -r '.tx | length')" "8" "block holds 7 migrations"
@@ -130,8 +152,8 @@ assert_eq "$(rpcr $RPC1 getblockchaininfo | jq -r .state_root)" "$(rpcr $RPC3 ge
 log "partition: stop node2, mine 1 on node1 and 2 on node3, reconnect => reorg to node3's chain"
 H=$(rpcr $RPC1 getblockcount)
 docker compose stop node2 >/dev/null
-rpcr $RPC1 generate "[1, \"$ALICE\"]" >/dev/null
-rpcr $RPC3 generate "[2, \"$BOB\"]" >/dev/null
+gen $RPC1 1 "$ALICE" >/dev/null
+gen $RPC3 2 "$BOB" >/dev/null
 TIP3=$(rpcr $RPC3 getbestblockhash)
 docker compose start node2 >/dev/null
 wait_rpc $RPC2
@@ -147,4 +169,4 @@ assert_eq "$(rpcr $RPC1 getbestblockhash)" "$TIP3" "node1 tip after restart"
 assert_eq "$(rpcr $RPC1 getblockchaininfo | jq -r .utxos)" "$(rpcr $RPC3 getblockchaininfo | jq -r .utxos)" "utxo count after restart"
 
 log "ALL E2E CHECKS PASSED (prove_mode=$PROVE_MODE, height=$(rpcr $RPC1 getblockcount))"
-docker compose down -v >/dev/null 2>&1 || true
+PASSED=1

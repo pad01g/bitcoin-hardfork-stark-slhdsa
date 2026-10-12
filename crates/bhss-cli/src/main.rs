@@ -100,6 +100,10 @@ enum Cmd {
         prove_mode: ProveMode,
         #[arg(long, default_value_t = 20)]
         segment_po2: u32,
+        /// Test hook: submit a fake receipt for the *block* image instead of
+        /// a migration proof; the node must reject it (MIG-2).
+        #[arg(long, hide = true)]
+        forge_receipt: bool,
     },
     /// Raw JSON-RPC call: `rpc <method> [param-json ...]`.
     Rpc {
@@ -144,7 +148,7 @@ impl Rpc {
         Ok(resp["result"].clone())
     }
     fn hrp(&self) -> Result<String> {
-        Ok(self.call("getblockchaininfo", json!([]))?["chain"].as_str().unwrap_or("bhrt").to_string())
+        self.call("getblockchaininfo", json!([]))?["chain"].as_str().map(str::to_string).ok_or_else(|| anyhow!("node did not report its network name"))
     }
     /// Spendable coins of `addr` at the next block height (coinbase maturity applied).
     fn spendable(&self, addr: &str) -> Result<Vec<Value>> {
@@ -164,6 +168,20 @@ impl Rpc {
         let s = self.call("getblockchaininfo", json!([]))?["genesis_hash"].as_str().unwrap_or("").to_string();
         hex::decode(s)?.try_into().map_err(|_| anyhow!("genesis hash"))
     }
+}
+
+/// Key files are created owner-readable only.
+fn write_private(path: &PathBuf, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path).with_context(|| format!("create {}", path.display()))?.write_all(data)?;
+    Ok(())
 }
 
 fn secret_hex(s: &str) -> Result<k256::SecretKey> {
@@ -204,7 +222,7 @@ fn main() -> Result<()> {
                 None => SecretKey::generate(&mut rand::rngs::OsRng),
             };
             let kf = KeyFile { secret: hex::encode(sk.to_bytes()), pubkey: hex::encode(sk.public_key().0) };
-            std::fs::write(&out, serde_json::to_string_pretty(&kf)?)?;
+            write_private(&out, serde_json::to_string_pretty(&kf)?.as_bytes())?;
             println!("{}", kf.pubkey);
         }
         Cmd::Address { key, hrp } => {
@@ -226,25 +244,34 @@ fn main() -> Result<()> {
             let my_kind = OutputKind::P2pkSlh { pkh: sk.public_key().hash() };
             let my_addr = address::encode(&hrp, &my_kind)?;
             let to_kind = address::decode(&hrp, &to).map_err(|e| anyhow!("to address: {e}"))?;
+            let need = amount.checked_add(fee).filter(|n| *n <= MAX_MONEY).ok_or_else(|| anyhow!("amount + fee exceeds MAX_MONEY"))?;
+            if amount == 0 {
+                bail!("amount must be positive");
+            }
             let utxos = rpc.spendable(&my_addr)?;
             let mut selected: Vec<(OutPoint, Coin)> = Vec::new();
             let mut total = 0u64;
             for u in &utxos {
-                let txid: Hash32 = hex::decode(u["txid"].as_str().unwrap())?.try_into().unwrap();
-                let op = OutPoint::new(txid, u["vout"].as_u64().unwrap() as u32);
-                let coin = Coin { output: Output { value: u["value"].as_u64().unwrap(), kind: my_kind.clone() }, height: u["height"].as_u64().unwrap() as u32, coinbase: u["coinbase"].as_bool().unwrap() };
-                total += coin.output.value;
+                let txid: Hash32 = hex::decode(u["txid"].as_str().ok_or_else(|| anyhow!("listunspent: txid"))?)?.try_into().map_err(|_| anyhow!("listunspent: txid length"))?;
+                let op = OutPoint::new(txid, u["vout"].as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| anyhow!("listunspent: vout"))?);
+                let coin = Coin {
+                    output: Output { value: u["value"].as_u64().ok_or_else(|| anyhow!("listunspent: value"))?, kind: my_kind.clone() },
+                    height: u["height"].as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| anyhow!("listunspent: height"))?,
+                    coinbase: u["coinbase"].as_bool().unwrap_or(false),
+                };
+                total = total.checked_add(coin.output.value).ok_or_else(|| anyhow!("balance overflow"))?;
                 selected.push((op, coin));
-                if total >= amount + fee {
+                if total >= need {
                     break;
                 }
             }
-            if total < amount + fee {
-                bail!("insufficient funds: have {total}, need {}", amount + fee);
+            if total < need {
+                bail!("insufficient funds: have {total}, need {need}");
             }
             let mut outputs = vec![Output { value: amount, kind: to_kind }];
-            if total - amount - fee > 0 {
-                outputs.push(Output { value: total - amount - fee, kind: my_kind.clone() });
+            let change = total - need;
+            if change > 0 {
+                outputs.push(Output { value: change, kind: my_kind.clone() });
             }
             let mut tx = Transaction {
                 version: Transaction::VERSION,
@@ -272,7 +299,7 @@ fn main() -> Result<()> {
             let (spk, _) = legacy_script(kind, &ks, threshold)?;
             println!("{}", hex::encode(spk));
         }
-        Cmd::Migrate { kind, keys, signers, threshold, txid, vout, to, fee, prove_mode, segment_po2 } => {
+        Cmd::Migrate { kind, keys, signers, threshold, txid, vout, to, fee, prove_mode, segment_po2, forge_receipt } => {
             let ks: Vec<k256::SecretKey> = keys.iter().map(|k| secret_hex(k)).collect::<Result<_>>()?;
             let (spk, script) = legacy_script(kind, &ks, threshold)?;
             let hrp = rpc.hrp()?;
@@ -308,12 +335,18 @@ fn main() -> Result<()> {
                     lsign::auth_multisig(script.as_ref().unwrap(), &refs, &m)
                 }
             };
-            let input = MigrationInput { msg: m, script_pubkey: spk, auth };
+            let input = MigrationInput { msg: m, script_pubkey: spk.clone(), auth };
             let cfg = ProverConfig { mode: prove_mode, segment_po2: Some(segment_po2) };
-            eprintln!("proving migration ({prove_mode:?})...");
-            let started = std::time::Instant::now();
-            let receipt = bhss_prover::prove_migration(&cfg, &input)?;
-            eprintln!("migration receipt: {} bytes in {:.1}s", receipt.len(), started.elapsed().as_secs_f64());
+            let receipt = if forge_receipt {
+                let journal = MigrationJournal { msg: m, script_hash: MigrationJournal::script_hash_of(&spk) };
+                bhss_prover::forge_fake_receipt(bhss_prover::BLOCK_ID, &journal.to_bytes())?
+            } else {
+                eprintln!("proving migration ({prove_mode:?})...");
+                let started = std::time::Instant::now();
+                let receipt = bhss_prover::prove_migration(&cfg, &input)?;
+                eprintln!("migration receipt: {} bytes in {:.1}s", receipt.len(), started.elapsed().as_secs_f64());
+                receipt
+            };
             let mut tx = tx;
             tx.proofs = vec![receipt];
             let r = rpc.call("sendrawtransaction", json!([hex::encode(tx.to_bytes())]))?;

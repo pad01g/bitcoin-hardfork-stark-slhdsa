@@ -11,9 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 bhss-primitives = { workspace = true, features = ["std", "serde", "address"] }
-bhss-smt = { workspace = true }
-bhss-slhdsa = { workspace = true }
-bhss-consensus = { workspace = true }
+bhss-consensus = { workspace = true, features = ["std"] }
 bhss-prover = { workspace = true }
 bhss-snapshot = { workspace = true }
 anyhow = { workspace = true }
@@ -25,4 +23,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hex = { workspace = true, features = ["std"] }
-bech32 = { workspace = true }
+
+[dev-dependencies]
+bhss-slhdsa = { workspace = true }

@@ -1,8 +1,8 @@
-//! PRF-1..PRF-5: producing and checking the STARK receipts that BHSS
+//! PRF-1..PRF-7: producing and checking the STARK receipts that BHSS
 //! consensus requires.
 //!
 //! Two proving modes exist:
-//! * `Real` — `default_prover()` with succinct receipts (STARK, ~200 KB).
+//! * `Real` — `default_prover()` with succinct receipts (STARK, ~250 KB).
 //! * `Dev`  — execute the guest only and wrap the journal in a RISC Zero
 //!   *fake* receipt. Chains with `require_real_proofs = false` accept these
 //!   (PRF-5); they prove nothing and exist for fast regtest iteration.
@@ -12,8 +12,8 @@ use bhss_consensus::{MigrationChecker, PrevState};
 use bhss_legacy::MigrationInput;
 use bhss_primitives::types::{Block, BlockJournal, MigrationJournal, Transaction};
 use bhss_primitives::{ChainParams, Decode, Encode, Hash32};
-use risc0_zkvm::sha::{Digest, Digestible};
-use risc0_zkvm::{default_executor, default_prover, ExecutorEnv, ExecutorEnvBuilder, InnerReceipt, ProverOpts, Receipt, ReceiptClaim, FakeReceipt};
+use risc0_zkvm::sha::Digestible;
+use risc0_zkvm::{default_executor, default_prover, ExecutorEnv, ExecutorEnvBuilder, FakeReceipt, InnerReceipt, ProverOpts, Receipt, ReceiptClaim, VerifierContext};
 
 pub use bhss_methods::{BLOCK_ELF, BLOCK_ID, MIGRATE_ELF, MIGRATE_ID};
 
@@ -48,43 +48,115 @@ impl Default for ProverConfig {
 }
 
 pub fn block_image_id() -> Hash32 {
-    *Digest::from(BLOCK_ID).as_bytes().first_chunk::<32>().unwrap()
+    bhss_methods::block_image_id()
 }
 
 pub fn migrate_image_id() -> Hash32 {
-    *Digest::from(MIGRATE_ID).as_bytes().first_chunk::<32>().unwrap()
+    bhss_methods::migrate_image_id()
+}
+
+/// Verifier context that never honours `RISC0_DEV_MODE` (PRF-5: fake
+/// receipts are accepted only through `allow_fake`, which comes from the
+/// chain parameters, never from the environment).
+fn strict_context() -> VerifierContext {
+    VerifierContext::default().with_dev_mode(false)
 }
 
 pub fn encode_receipt(r: &Receipt) -> Result<Vec<u8>> {
     Ok(bincode::serialize(r)?)
 }
 
+/// PRF-7: receipts larger than `MAX_RECEIPT_LEN` are rejected before
+/// deserialization (bincode would otherwise allocate whatever the length
+/// prefixes claim).
 pub fn decode_receipt(bytes: &[u8]) -> Result<Receipt> {
-    Ok(bincode::deserialize(bytes)?)
+    if bytes.len() > bhss_primitives::types::MAX_RECEIPT_LEN {
+        bail!("PRF-7: receipt of {} bytes exceeds MAX_RECEIPT_LEN", bytes.len());
+    }
+    let opts = bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(bhss_primitives::types::MAX_RECEIPT_LEN as u64 * 4);
+    use bincode::Options;
+    Ok(opts.deserialize(bytes)?)
 }
 
 pub fn is_fake(r: &Receipt) -> bool {
     matches!(r.inner, InnerReceipt::Fake(_))
 }
 
-/// PRF-3 / MIG-2: check a receipt against an image id and the exact journal
-/// bytes the verifier expects. Fake receipts pass only if `allow_fake`.
+/// PRF-3 / MIG-2 / PRF-6: check a receipt against an image id and the exact
+/// journal bytes the verifier expects. Fake receipts pass only if
+/// `allow_fake`; anything else must be a succinct (STARK) receipt — composite
+/// receipts could carry fake assumptions and Groth16 adds a trusted setup.
 pub fn verify_receipt(r: &Receipt, image_id: [u32; 8], expected_journal: &[u8], allow_fake: bool) -> Result<()> {
     if r.journal.bytes != expected_journal {
         bail!("journal mismatch");
     }
-    if is_fake(r) {
-        if !allow_fake {
-            bail!("fake (dev-mode) receipt rejected: chain requires real proofs");
+    match &r.inner {
+        InnerReceipt::Fake(_) => {
+            if !allow_fake {
+                bail!("fake (dev-mode) receipt rejected: chain requires real proofs (PRF-5)");
+            }
+            let claim = r.claim().context("fake receipt claim")?;
+            let expected = ReceiptClaim::ok(image_id, expected_journal.to_vec());
+            if claim.digest() != expected.digest() {
+                bail!("fake receipt claim mismatch");
+            }
+            Ok(())
         }
-        let claim = r.claim().context("fake receipt claim")?;
-        let expected = ReceiptClaim::ok(image_id, expected_journal.to_vec());
-        if claim.digest() != expected.digest() {
-            bail!("fake receipt claim mismatch");
-        }
-        return Ok(());
+        InnerReceipt::Succinct(_) => r.verify_with_context(&strict_context(), image_id).map_err(|e| anyhow!("receipt verification failed: {e}")),
+        other => bail!("PRF-6: receipt kind {} is not accepted (succinct required)", ReceiptKind::of(other)),
     }
-    r.verify(image_id).map_err(|e| anyhow!("receipt verification failed: {e}"))
+}
+
+/// What a serialized receipt is (PRF-5, PRF-6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptKind {
+    /// RISC Zero dev-mode receipt: proves nothing.
+    Fake,
+    /// The only real kind consensus accepts.
+    Succinct,
+    Composite,
+    Groth16,
+    /// Does not deserialize, or an unknown variant.
+    Invalid,
+}
+
+impl ReceiptKind {
+    fn of(inner: &InnerReceipt) -> Self {
+        match inner {
+            InnerReceipt::Fake(_) => ReceiptKind::Fake,
+            InnerReceipt::Succinct(_) => ReceiptKind::Succinct,
+            InnerReceipt::Composite(_) => ReceiptKind::Composite,
+            InnerReceipt::Groth16(_) => ReceiptKind::Groth16,
+            _ => ReceiptKind::Invalid,
+        }
+    }
+}
+
+impl std::fmt::Display for ReceiptKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReceiptKind::Fake => "fake",
+            ReceiptKind::Succinct => "succinct",
+            ReceiptKind::Composite => "composite",
+            ReceiptKind::Groth16 => "groth16",
+            ReceiptKind::Invalid => "invalid",
+        })
+    }
+}
+
+/// Classify a serialized receipt (diagnostics and mempool policy).
+pub fn receipt_kind(bytes: &[u8]) -> ReceiptKind {
+    match decode_receipt(bytes) {
+        Ok(r) => ReceiptKind::of(&r.inner),
+        Err(_) => ReceiptKind::Invalid,
+    }
+}
+
+/// Whether `RISC0_DEV_MODE` is set the way risc0 itself parses it. BHSS
+/// never lets it decide anything: verification ignores it (PRF-5) and real
+/// proving refuses to run under it.
+pub fn dev_mode_env() -> bool {
+    std::env::var("RISC0_DEV_MODE").map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes")).unwrap_or(false)
 }
 
 fn prove(cfg: &ProverConfig, mut env: ExecutorEnvBuilder<'_>, elf: &[u8], image_id: [u32; 8]) -> Result<Receipt> {
@@ -102,7 +174,9 @@ fn prove(cfg: &ProverConfig, mut env: ExecutorEnvBuilder<'_>, elf: &[u8], image_
             Ok(Receipt::new(InnerReceipt::Fake(FakeReceipt::new(claim)), journal))
         }
         ProveMode::Real => {
-            if std::env::var("RISC0_DEV_MODE").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+            // The receipt-kind check below also catches dev mode enabled
+            // some other way.
+            if dev_mode_env() {
                 bail!("RISC0_DEV_MODE is set; refusing to produce a 'real' proof");
             }
             let started = std::time::Instant::now();
@@ -110,7 +184,10 @@ fn prove(cfg: &ProverConfig, mut env: ExecutorEnvBuilder<'_>, elf: &[u8], image_
                 .prove_with_opts(env, elf, &ProverOpts::succinct())
                 .map_err(|e| anyhow!("proving failed: {e:#}"))?;
             tracing::info!(cycles = info.stats.total_cycles, secs = started.elapsed().as_secs_f64(), "real proof complete");
-            info.receipt.verify(image_id)?;
+            if !matches!(info.receipt.inner, InnerReceipt::Succinct(_)) {
+                bail!("prover returned a {} receipt, expected succinct (PRF-6)", ReceiptKind::of(&info.receipt.inner));
+            }
+            info.receipt.verify_with_context(&strict_context(), image_id)?;
             Ok(info.receipt)
         }
     }
@@ -125,6 +202,14 @@ pub fn prove_migration(cfg: &ProverConfig, input: &MigrationInput) -> Result<Vec
     env.write_frame(&input.to_bytes());
     let receipt = prove(cfg, env, MIGRATE_ELF, MIGRATE_ID)?;
     encode_receipt(&receipt)
+}
+
+/// A fake receipt for an arbitrary image id / journal. Only for tests of the
+/// *rejection* paths (PRF-5): it is exactly what an attacker on a dev chain
+/// could produce without running any guest.
+pub fn forge_fake_receipt(image_id: [u32; 8], journal: &[u8]) -> Result<Vec<u8>> {
+    let claim = ReceiptClaim::ok(image_id, journal.to_vec());
+    encode_receipt(&Receipt::new(InnerReceipt::Fake(FakeReceipt::new(claim)), journal.to_vec()))
 }
 
 pub fn verify_migration_receipt(bytes: &[u8], journal: &MigrationJournal, allow_fake: bool) -> Result<Receipt> {
@@ -169,10 +254,22 @@ impl MigrationChecker for NativeMigrationChecker<'_> {
 // Block proofs
 // ----------------------------------------------------------------------------
 
-/// Expected journal for `block` (PRF-2); the caller supplies the roots it
-/// computed natively.
-pub fn expected_block_journal(params: &ChainParams, height: u32, block_hash: Hash32, root_prev: Hash32, root_next: Hash32) -> BlockJournal {
-    BlockJournal { params_hash: params.hash(), height, block_hash, root_prev, root_next, migrate_image_id: migrate_image_id() }
+/// Expected journal for a block (PRF-2/PRF-3), built from the verifier's
+/// own view: its parameters and genesis, the parent (`height`, `time`,
+/// `state_root`) and the block's header (`block_hash`, `state_root`). It
+/// needs no validation result, so the receipt can be checked first; HDR-3
+/// then guarantees that native validation reaches the same `root_next`.
+pub fn expected_block_journal(params: &ChainParams, genesis_hash: &Hash32, prev: &PrevState, header: &bhss_primitives::types::Header) -> BlockJournal {
+    BlockJournal {
+        params_hash: params.hash(),
+        genesis_hash: *genesis_hash,
+        height: prev.height.wrapping_add(1),
+        block_hash: header.hash(),
+        prev_time: prev.time,
+        root_prev: prev.state_root,
+        root_next: header.state_root,
+        migrate_image_id: migrate_image_id(),
+    }
 }
 
 /// Produce the receipt for `block` (whose `receipt` field is ignored). The
@@ -180,6 +277,13 @@ pub fn expected_block_journal(params: &ChainParams, height: u32, block_hash: Has
 pub fn prove_block(cfg: &ProverConfig, params: &ChainParams, genesis_hash: &Hash32, prev: &PrevState, block: &Block) -> Result<Vec<u8>> {
     let mut stripped = block.clone();
     stripped.receipt.clear();
+    // The guest checks migrations through `env::verify` on their journals
+    // and needs only the number of proofs per transaction (TX-9), not their
+    // bytes, which no hash commits to. Emptying them keeps ~250 KB per
+    // migration (about 1.6 M cycles of input decoding each) out of the guest.
+    for p in stripped.txs.iter_mut().flat_map(|tx| tx.proofs.iter_mut()) {
+        p.clear();
+    }
     let mut env = ExecutorEnv::builder();
     for tx in &block.txs {
         for p in &tx.proofs {

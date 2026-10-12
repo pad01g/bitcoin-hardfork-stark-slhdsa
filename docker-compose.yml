@@ -1,4 +1,6 @@
 # Three-node regtest used by tests/e2e.sh. Built from ./bin via docker/Dockerfile.node.
+# The RPC has no authentication, so the host ports are bound to loopback only
+# (override with RPC1_PORT=0.0.0.0:18443 etc. if you really want them exposed).
 services:
   node1:
     build: { context: ., dockerfile: docker/Dockerfile.node }
@@ -8,7 +10,7 @@ services:
               "--p2p-bind", "0.0.0.0:18555", "--rpc-bind", "0.0.0.0:18443",
               "--prove-mode", "${PROVE_MODE:-dev}", "--segment-po2", "${SEGMENT_PO2:-17}"]
     volumes: [".e2e/net:/net:ro", ".e2e/node1:/data"]
-    ports: ["18443:18443"]
+    ports: ["${RPC1_PORT:-127.0.0.1:18443}:18443"]
   node2:
     image: bhss-node:latest
     platform: linux/amd64
@@ -16,7 +18,7 @@ services:
               "--p2p-bind", "0.0.0.0:18555", "--rpc-bind", "0.0.0.0:18443", "--connect", "node1:18555",
               "--prove-mode", "${PROVE_MODE:-dev}", "--segment-po2", "${SEGMENT_PO2:-17}"]
     volumes: [".e2e/net:/net:ro", ".e2e/node2:/data"]
-    ports: ["18444:18443"]
+    ports: ["${RPC2_PORT:-127.0.0.1:18444}:18443"]
     depends_on: [node1]
   node3:
     image: bhss-node:latest
@@ -25,7 +27,7 @@ services:
               "--p2p-bind", "0.0.0.0:18555", "--rpc-bind", "0.0.0.0:18443", "--connect", "node2:18555",
               "--prove-mode", "${PROVE_MODE:-dev}", "--segment-po2", "${SEGMENT_PO2:-17}"]
     volumes: [".e2e/net:/net:ro", ".e2e/node3:/data"]
-    ports: ["18445:18443"]
+    ports: ["${RPC3_PORT:-127.0.0.1:18445}:18443"]
     depends_on: [node2]
   cli:
     image: bhss-node:latest

@@ -1,4 +1,4 @@
-//! SPEC §11 — legacy (snapshot) coins and migration authorization.
+//! SPEC §15 — legacy (snapshot) coins and migration authorization.
 //!
 //! A Legacy coin carries a Bitcoin scriptPubKey. BHSS does not run Bitcoin
 //! Script; instead each supported *template* (LEG-1) is recognised
@@ -156,7 +156,16 @@ impl Decode for MigrationAuth {
     }
 }
 
+/// CRYPTO-4: exactly the two encodings Bitcoin signs with today. SEC1 also
+/// defines hybrid (0x06/0x07) and compact (0x05) forms; neither is accepted.
+fn is_standard_pubkey(pubkey: &[u8]) -> bool {
+    matches!((pubkey.len(), pubkey.first()), (33, Some(0x02 | 0x03)) | (65, Some(0x04)))
+}
+
 fn ecdsa_verify(pubkey: &[u8], msg: &Hash32, sig: &[u8; 64]) -> bool {
+    if !is_standard_pubkey(pubkey) {
+        return false;
+    }
     let vk = match k256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey) {
         Ok(v) => v,
         Err(_) => return false,
@@ -165,6 +174,10 @@ fn ecdsa_verify(pubkey: &[u8], msg: &Hash32, sig: &[u8; 64]) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
+    // CRYPTO-4: high-S signatures are permitted (k256 rejects them unless
+    // normalized; malleability is irrelevant here because the journal binds
+    // the message, not the signature).
+    let sig = sig.normalize_s().unwrap_or(sig);
     vk.verify_prehash(msg, &sig).is_ok()
 }
 

@@ -29,13 +29,13 @@ pub enum Tag {
     SigHash = 0x07,
     /// Migration message: `H(0x08 || genesis_hash || txid || index_le32 || leaf_hash)`
     MigrationMsg = 0x08,
-    /// Migration journal digest (reserved; journal is committed raw)
+    /// Reserved (unused): migration journals are committed raw (MIG-4).
     MigrationJournal = 0x09,
     /// Chain params hash: `H(0x0A || enc(ChainParams))`
     Params = 0x0A,
     /// Merkle inner node: `H(0x0B || left || right)`
     MerkleNode = 0x0B,
-    /// Genesis state hash: `H(0x0C || enc(Vec<(OutPoint, Coin)>))`
+    /// Reserved (unused): the genesis state is committed by its SMT root (GEN-2).
     GenesisState = 0x0C,
     /// Legacy script hash in migration journal: `H(0x0D || script_pubkey)`
     LegacyScript = 0x0D,

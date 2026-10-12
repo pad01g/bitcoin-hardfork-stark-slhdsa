@@ -69,9 +69,10 @@ never depend on the proof system.
 | 0x06 | Witness | witness hash (TX-4) |
 | 0x07 | SigHash | SLH-DSA signing message (SIG-1) |
 | 0x08 | MigrationMsg | legacy signing message (MIG-3) |
+| 0x09 | MigrationJournal | reserved (unused; journals are committed raw) |
 | 0x0A | Params | chain parameter hash (PAR-2) |
 | 0x0B | MerkleNode | Merkle inner node (BLK-3) |
-| 0x0C | GenesisState | reserved for genesis state digests |
+| 0x0C | GenesisState | reserved (unused; the genesis state is committed by its SMT root) |
 | 0x0D | LegacyScript | script hash in migration journal (MIG-4) |
 | 0x10 | SlhPubKey | SLH-DSA public key hash (OUT-1) |
 
@@ -123,18 +124,23 @@ OutPoint    = txid:32 ‖ vout:u32
 
 * **OUT-1.** `P2pkSlh.pkh = H_0x10(pubkey)` where `pubkey` is a 32-byte
   SLH-DSA-SHA2-128s public key.
-* **OUT-2.** `MultisigSlh`: `1 ≤ k ≤ n = len(pkhs) ≤ 16`.
+* **OUT-2.** `MultisigSlh`: `1 ≤ k ≤ n = len(pkhs) ≤ 16`, and the `pkhs`
+  are pairwise distinct (a repeated key would turn k-of-n into fewer-of-n).
 * **OUT-3.** `Timelock`: at least one of `abs_height`, `rel_blocks` is
-  non-zero; `inner` MUST be `P2pkSlh` or `MultisigSlh` (no nesting).
+  non-zero; `inner` MUST be `P2pkSlh` or `MultisigSlh`. Nesting is
+  impossible at the encoding level: inside a `Timelock` only tags `0x00`
+  and `0x01` are valid (decoders MUST NOT recurse).
 * **OUT-4.** `Data.data` is at most 1 024 bytes.
 * **OUT-5.** A `Data` output MUST have `value = 0`. Data outputs are never
   inserted into the UTXO set.
 * **OUT-6.** A transaction MUST NOT create a `Legacy` output. Legacy
   outputs exist only in the genesis state (§13). Their script is 1 to
   10 000 bytes.
-* **AMT-1.** Every value and every sum of values a rule computes MUST be
+* **AMT-1.** Every value and every sum of values a rule computes (output
+  sums, input sums, the block's fees, `subsidy + fees`) MUST be
   `≤ MAX_MONEY = 21 000 000 × 10⁸`; arithmetic that would overflow `u64`
-  is invalid.
+  is invalid. (A coinbase that merely pays more than `subsidy + fees` is a
+  CB-3 failure.)
 * **COIN-1.** A coin records the output, the height of the block that
   created it and whether that transaction was the coinbase.
 
@@ -172,8 +178,10 @@ Witness     = tag:u8 ‖ body
 * **TX-9.** `len(proofs)` MUST equal the number of inputs whose spent coin
   is `Legacy` (so zero for ordinary transactions and for the coinbase).
   `proofs[j]` belongs to the j-th input (which, by MIG-1, is input `j`).
-* **TX-10.** The *committed size* of a transaction is the length of its
-  encoding with `proofs` replaced by an empty vector.
+  Each proof is at most `MAX_RECEIPT_LEN` bytes (PRF-7).
+* **TX-10.** The *committed size* of a transaction is
+  `len(version ‖ vec<Input> ‖ vec<Output> ‖ locktime)`, i.e. its encoding
+  without the `proofs` field.
 
 ---
 
@@ -181,7 +189,9 @@ Witness     = tag:u8 ‖ body
 
 > **日本語要約**: ブロック = ヘッダ + tx 列 + ブロック witness(消費コインと SMT
 > 証明) + レシート。Merkle root は tx_commit に対して計算し、奇数要素は複製せず
-> そのまま持ち上げる。
+> そのまま持ち上げる。witness・レシート・proofs はヘッダにコミットされないので、
+> block_hash が同じでも有効性が異なるコピーがありうる(ノードは検証済みのコピーしか
+> 保存しない)。ブロック全体は 32 MiB 以下(BLK-12)。
 
 ```
 Header       = version:u32 ‖ prev_hash:32 ‖ merkle_root:32 ‖ state_root:32 ‖ time:u32 ‖ bits:u32 ‖ nonce:u32
@@ -191,8 +201,12 @@ SmtProof     = bitmap:32 ‖ vec<sibling:32>
 ```
 
 * **BLK-1.** Block encoding as above. `receipt` is the serialized RISC
-  Zero receipt (§14); `witness` and `receipt` are not committed by the
-  header — they are validated by content.
+  Zero receipt (§14); `witness`, `receipt` and `Transaction::proofs` are
+  not committed by the header — they are validated by content. Hence
+  `block_hash` identifies the *committed* part only: two byte strings with
+  the same hash can differ in validity. A node MUST NOT treat a block hash
+  as permanently invalid because one copy failed a check on uncommitted
+  data, and MUST NOT keep a copy it has not validated (see NET-5).
 * **BLK-2.** `witness.coins` lists, in block order, the coin spent by each
   input of every non-coinbase transaction. `witness.proofs` lists one SMT
   proof per state operation in the order of STATE-1.
@@ -212,25 +226,47 @@ SmtProof     = bitmap:32 ‖ vec<sibling:32>
 * **BLK-10.** `len(witness.coins)` MUST equal the number of non-coinbase
   inputs.
 * **BLK-11.** `len(witness.proofs)` MUST equal the number of state
-  operations: every proof is consumed, none is left over.
+  operations (non-coinbase inputs + non-`Data` outputs of all transactions,
+  STATE-1). Validators check the count before any state or signature
+  work; every proof is then consumed in order, none is left over.
+* **BLK-12.** `len(enc(Block))` (header, transactions *including* proofs,
+  witness and receipt) MUST be `≤ MAX_BLOCK_LEN = 2²⁵` (32 MiB). The guest
+  never sees receipts, so like PRF-3 this rule is checked by nodes only.
 
 ---
 
 ## 7. Chain parameters
 
 > **日本語要約**: ネットワーク固有の定数。`params_hash` が各ブロックの journal に
-> 入るため、パラメータが違えば証明も互換しない。
+> 入るため、パラメータが違えば証明も互換しない。guest の image ID も params に
+> 含まれ(PAR-5)、ノードは起動時にパラメータの妥当性(PAR-4)と、自身に埋め込まれた
+> guest との一致を検査する。
 
 ```
 ChainParams = name:bytes ‖ max_block_tx_bytes:u32 ‖ max_sig_checks:u32 ‖ max_migrations:u32
             ‖ coinbase_maturity:u32 ‖ subsidy_halving_interval:u32 ‖ initial_subsidy:u64
             ‖ pow_bits:u32 ‖ genesis_time:u32 ‖ genesis_state_root:32 ‖ require_real_proofs:bool
+            ‖ block_image_id:32 ‖ migrate_image_id:32
 ```
 
 * **PAR-1.** Defaults (`bhrt`): 131 072 / 16 / 16 / 100 / 150 /
-  5 000 000 000 / 0x207fffff / 1 760 000 000 / (computed) / false.
+  5 000 000 000 / 0x207fffff / 1 760 000 000 / (computed from the genesis
+  state) / false / (the image IDs of the guests the network is created
+  with, PAR-5).
 * **PAR-2.** `params_hash = H_0x0A(enc(ChainParams))`.
 * **PAR-3.** `name` is also the bech32m human-readable part (ADDR-1).
+* **PAR-4.** A parameter set is usable only if `name` is 1–83 characters
+  of `[a-z0-9]`, `subsidy_halving_interval > 0`, `max_block_tx_bytes > 0`,
+  `max_sig_checks > 0`, `initial_subsidy ≤ MAX_MONEY`, and
+  `target(pow_bits)` is non-zero and fits 256 bits (exponent `≤ 32`).
+  Nodes refuse to start otherwise.
+* **PAR-5.** `block_image_id` / `migrate_image_id` are the RISC Zero image
+  IDs (32 bytes, little-endian words) of the two guest programs (PRF-1,
+  MIG-2). They are part of `params_hash`, so a chain is bound to exact
+  guest binaries; a node whose embedded guests differ (or that carries no
+  guests, i.e. zero IDs) MUST refuse to start. `bhss-snapshot` writes the
+  IDs of the guests it was built with into `params.json`; the file must be
+  regenerated whenever the guest code or its toolchain changes.
 
 ---
 
@@ -308,12 +344,15 @@ For input `i` of transaction `tx` spending coin `c` at block height `h`:
   (`txid` already commits every prevout, output and locktime; `leaf(c)`
   commits the value and condition being spent; `genesis_hash` binds the
   network.)
-* **SIG-2.** `P2pkSlh{pkh}`: exactly one signer with `index = 0`,
+* **SIG-2.** `P2pkSlh{pkh}`: exactly one signer (any other count is a
+  SIG-2 failure) with `index = 0`,
   `H_0x10(pubkey) = pkh`, and `SLH-DSA.Verify(pubkey, sighash_i, signature)`
   (CRYPTO-3) succeeds.
 * **SIG-3.** `MultisigSlh{k, pkhs}`: exactly `k` signers with strictly
   increasing `index < len(pkhs)`; for each, `H_0x10(pubkey) = pkhs[index]`
-  and the signature verifies over `sighash_i`.
+  and the signature verifies over `sighash_i`. (Every failure of a
+  multisig spend, including a bad signature of one signer, is a SIG-3
+  failure; SIG-2 is reserved for `P2pkSlh`.)
 * **MIG-1.** If any input spends a `Legacy` coin then *all* inputs MUST
   spend `Legacy` coins, and every output kind MUST be `P2pkSlh`,
   `MultisigSlh` or `Timelock` (a *migration transaction*).
@@ -360,8 +399,13 @@ For input `i` of transaction `tx` spending coin `c` at block height `h`:
   order: a deletion requires `root(key, leaf(c), p) = current_root` and sets
   `current_root ← root(key, 0³², p)`; an insertion requires
   `root(key, 0³², p) = current_root` and sets `current_root ← root(key, leaf, p)`.
-  A stateful verifier additionally checks every witness coin against its
-  own UTXO set (STATE-3) and MUST reach the same root.
+  A failed proof check is a STATE-2 failure. A stateful verifier first
+  checks every operation against its own UTXO set (STATE-3, STATE-4) and
+  MUST reach the same root. Both kinds of verifier therefore always agree
+  on whether a block is valid, but they may name different rules for the
+  same invalid block: a stateless verifier (the guest, or a node judging
+  a block on a side branch) cannot tell "the coin is not in the set"
+  from "the proof is wrong" and reports STATE-2 for both.
 * **STATE-5.** The root before the block is the parent's `state_root`; the
   root after must equal `header.state_root` (HDR-3).
 
@@ -371,46 +415,61 @@ For input `i` of transaction `tx` spending coin `c` at block height `h`:
 
 > **日本語要約**: ジェネシスはパラメータから決定論的に生成。スナップショット由来の
 > コインは height 0・coinbase false の Legacy として SMT に入り、その root が
-> `genesis_state_root`。
+> `genesis_state_root`。outpoint は重複せず、合計額は MAX_MONEY 以下(GEN-2)。
 
 * **GEN-1.** The genesis block has `prev_hash = 0³²`, one coinbase with
   prevout `(0³², 0)` and a single `Data{"BHSS genesis"}` output of value 0,
   `state_root = genesis_state_root`, `time = genesis_time`,
   `bits = pow_bits`, and the smallest `nonce` satisfying POW-1. It carries
   no receipt and is never validated by §9–§12.
-* **GEN-2.** The genesis state is a set of `(OutPoint, Coin)`; its root is
-  the SMT root after inserting every entry. Because SMT roots are
-  order-independent, anyone can recompute it from the set.
+* **GEN-2.** The genesis state is a set of `(OutPoint, Coin)` with
+  pairwise distinct outpoints, every coin a well-formed `Legacy` coin
+  (OUT-6) with `height = 0`, `coinbase = false`, and a total value
+  `≤ MAX_MONEY`. Its root is the SMT root after inserting every entry.
+  Because SMT roots are order-independent, anyone can recompute it from
+  the set.
 * **GEN-3.** When importing a Bitcoin Core `dumptxoutset`, each coin
   becomes `Coin{Output{value, Legacy{script_pubkey}}, height = 0, coinbase = false}`
   under its original outpoint.
-* **GEN-4.** Unspendable scripts (empty, or starting with `OP_RETURN`, or
-  longer than 10 000 bytes) are not imported.
-* **GEN-5.** `genesis_hash` (used by SIG-1, MIG-3 and the network handshake)
-  is the hash of the genesis header.
+* **GEN-4.** Unspendable scripts (empty, or starting with `OP_RETURN`) are
+  not imported. A snapshot containing a script longer than 10 000 bytes
+  (which Bitcoin Core never writes) is rejected as corrupt, as is one with
+  non-canonical lengths, an amount that overflows, or trailing bytes.
+* **GEN-5.** `genesis_hash` (used by SIG-1, MIG-3, the block journal
+  (PRF-2) and the network handshake) is the hash of the genesis header.
 
 ---
 
 ## 14. Block proofs
 
 > **日本語要約**: ブロックの guest(RISC Zero)は本仕様 §9–§12 をステートレスに
-> 実行し、journal に (params_hash, height, block_hash, root_prev, root_next,
-> migrate_image_id) を出力する。ノードはレシートを image ID と journal の完全一致で
-> 検証し、`require_real_proofs=false` のチェーンでは dev-mode の偽レシートも受理する。
+> 実行し、journal に (params_hash, genesis_hash, height, block_hash, prev_time,
+> root_prev, root_next, migrate_image_id) を出力する。guest への入力のうち
+> block_hash から導けないものはすべて journal に含める(含めないと証明者が
+> 別の値を与えて「正しい証明」を作れてしまう)。ノードはレシートを image ID と
+> journal の完全一致で検証し、`require_real_proofs=false` のチェーンでは
+> dev-mode の偽レシートも受理する。レシートは 1 MiB 以下。証明系はハッシュベースのみ
+> (FRI STARK、ハッシュは Poseidon2、推測ベースで 97 ビット)。Groth16 などの SNARK は
+> 生成も受理もしない(PRF-6, PRF-8)。
 
 * **PRF-1.** The block guest is the RISC Zero program in
   `crates/bhss-methods/guest/src/bin/block.rs`; its image ID is
-  consensus. Its private inputs are `enc(ChainParams)`, `genesis_hash`,
+  consensus (`params.block_image_id`, PAR-5). Its private inputs are `enc(ChainParams)`, `genesis_hash`,
   `enc(PrevState)` (`height ‖ hash ‖ state_root ‖ time` of the parent),
-  `enc(Block)` with an empty `receipt`, and the migration image ID.
+  `enc(Block)` with an empty `receipt`, and the migration image ID. (A prover SHOULD also empty every `Transaction::proofs` entry in that input, keeping their number: the guest uses only the count (TX-9), and the bytes are not committed by any hash.)
 * **PRF-2.** The guest runs §9–§12 with a proof-backed state (STATE-2),
   requires BLK-11, and commits the journal
-  `enc(BlockJournal) = params_hash ‖ height:u32 ‖ block_hash ‖ root_prev ‖ root_next ‖ migrate_image_id`.
+  `enc(BlockJournal) = params_hash ‖ genesis_hash ‖ height:u32 ‖ block_hash ‖ prev_time:u32 ‖ root_prev ‖ root_next ‖ migrate_image_id`.
+  Every private input that is not fixed by `block_hash` (the parameters,
+  the genesis hash used in SIG-1/MIG-3, the parent's height, time and
+  state root, and the migration image ID) therefore appears in the
+  journal; a prover cannot substitute any of them.
 * **PRF-3.** A node accepts `block.receipt` iff it deserializes to a RISC
   Zero receipt that verifies for the block image ID and whose journal
-  bytes equal `enc(BlockJournal)` built from the node's own native result
-  (`root_prev` = parent `state_root`, `root_next` = header `state_root`,
-  `migrate_image_id` = the node's migration image ID).
+  bytes equal `enc(BlockJournal)` built from the node's own view
+  (`params_hash`, its `genesis_hash`, the parent's `time` and
+  `state_root` as `prev_time`/`root_prev`, `root_next` = header
+  `state_root`, `migrate_image_id` = the node's migration image ID).
 * **PRF-4.** Migration receipts are composed: each MIG-2 check inside the
   guest is `env::verify(migrate_image_id, journal)`, so a real block
   receipt is only producible when every migration receipt is available
@@ -421,6 +480,24 @@ For input `i` of transaction `tx` spending coin `c` at block height `h`:
   chain has no proof-based security and exists for development only.
 * **PRF-6.** Receipts are serialized with `bincode` (serde) of
   `risc0_zkvm::Receipt`; real receipts MUST be succinct (STARK) receipts.
+  Composite receipts (which may carry fake assumption receipts) and Groth16
+  receipts (trusted setup) are rejected. Verification never consults the
+  `RISC0_DEV_MODE` environment variable: whether fake receipts pass is
+  decided by `require_real_proofs` alone (PRF-5).
+* **PRF-8.** The proof system is hash-based only. A succinct receipt is a
+  FRI-based STARK over the BabyBear field whose only cryptographic
+  assumption is the hash function used for its Merkle commitments and
+  Fiat–Shamir transcript; in RISC Zero 3.0.x that hash is **Poseidon2**
+  (segment proofs accept no other; a pure SHA-256 configuration does not
+  exist in this version), and the parameters target 97 bits of
+  *conjectured* security. No pairing-based SNARK and no trusted setup is
+  involved: Groth16 receipts are neither produced nor accepted (PRF-6).
+  As everywhere else in this specification (§1), this only protects
+  un-migrated legacy coins.
+* **PRF-7.** A serialized receipt (the block receipt, and each element of
+  `Transaction::proofs`) MUST be `≤ MAX_RECEIPT_LEN = 2²⁰` bytes. For
+  `proofs` this is checked by both guest and node (it is part of TX-9's
+  context); for the block receipt by nodes only.
 
 ---
 
@@ -450,8 +527,9 @@ For input `i` of transaction `tx` spending coin `c` at block height `h`:
 * **MIG-4.** `MigrationJournal = msg:32 ‖ script_hash:32`,
   `script_hash = H_0x0D(script_pubkey)`.
 * **MIG-5.** Authorization data (`MigrationAuth`, private input):
-  `0x00 KeyHash{pubkey:bytes, sig:64}` (P2PKH, P2WPKH, P2SH-P2WPKH with
-  `redeem = 00 14 HASH160(pubkey)`), `0x01 PubKey{sig:64}` (P2PK),
+  `0x00 KeyHash{pubkey:bytes, sig:64}` (P2PKH; P2WPKH and P2SH-P2WPKH
+  with `redeem = 00 14 HASH160(pubkey)`, for both of which the pubkey
+  MUST be the 33-byte compressed form), `0x01 PubKey{sig:64}` (P2PK),
   `0x02 Taproot{sig:64}` (P2TR key path, BIP340 over the output key),
   `0x03 Multisig{script:bytes, vec<sig:64>}` (P2SH: `HASH160(script)`;
   P2WSH: `SHA256(script)`).
@@ -468,7 +546,9 @@ For input `i` of transaction `tx` spending coin `c` at block height `h`:
 ## 16. Cryptography
 
 > **日本語要約**: SLH-DSA-SHA2-128s、FIPS 205 の pure モード、コンテキスト空、
-> 決定論的署名(署名者側)。検証側はランダム化の有無を区別しない。
+> 決定論的署名(署名者側)。検証側はランダム化の有無を区別しない。旧コインの検証は
+> secp256k1 ECDSA(high-S は正規化して受理)と BIP340 Schnorr。hybrid 公開鍵
+> (0x06/0x07)は非対応。
 
 * **CRYPTO-1.** The only signature scheme for SLH conditions is
   SLH-DSA-SHA2-128s (FIPS 205): public key 32 bytes, signature 7 856 bytes.
@@ -478,32 +558,113 @@ For input `i` of transaction `tx` spending coin `c` at block height `h`:
 * **CRYPTO-3.** Verification is `slh_verify(M = sighash_i, SIG, ctx = "")`.
   Any signature of the wrong length is invalid.
 * **CRYPTO-4.** Legacy verification uses secp256k1 ECDSA (compact 64-byte
-  signatures, high-S permitted) and BIP340 Schnorr.
+  signatures; high-S permitted — verifiers normalize `s` before checking)
+  and BIP340 Schnorr. ECDSA public keys are SEC1 compressed (33 bytes,
+  first byte `0x02`/`0x03`) or uncompressed (65 bytes, first byte `0x04`);
+  any other encoding (hybrid `0x06`/`0x07`, compact `0x05`) never verifies.
 
 ---
 
 ## 17. Addresses, network, RPC (non-consensus)
 
 > **日本語要約**: アドレスは bech32m(HRP = params.name, enc(OutputKind))。P2P は
-> 長さ接頭辞フレームの単純ゴシップ。RPC は JSON-RPC 2.0。いずれもコンセンサス外。
+> 長さ接頭辞フレームの単純ゴシップで、最初のフレームは Hello 必須(NET-7)。
+> 競合ブランチ(同じチェーンの、ベストチェーンに入らなかった枝。別チェーンの意味の
+> 「サイドチェーン」ではない)のブロックも、保存前に親の state root に対して
+> ステートレスに完全検証し、64 MiB まで保持する(NET-5)。mempool は 1 000 件 / 16 MiB(NET-6)。RPC は
+> JSON-RPC 2.0(認証なし)。いずれもコンセンサス外。
 
 * **ADDR-1.** `address = bech32m(hrp = params.name, enc(OutputKind))` for
   `P2pkSlh`, `MultisigSlh`, `Timelock` only.
-* **NET-1.** Frames are `len:u32 LE ‖ payload`, `payload = tag:u8 ‖ body`:
-  `0 Hello{network:bytes, genesis_hash, height:u32, tip}`, `1 Block`,
-  `2 Tx`, `3 GetBlocks{from_height:u32, count:u32}`, `4 vec<Block>`.
-* **NET-2.** Peers whose `Hello` names a different network or genesis are
-  disconnected.
-* **NET-3.** Blocks and transactions accepted by a node are relayed to all
-  other peers; a block with unknown parent triggers `GetBlocks`.
+* **NET-1.** Frames are `len:u32 LE ‖ payload` (`len ≤ 48 MiB`),
+  `payload = tag:u8 ‖ body`:
+  `0 Hello{network:bytes, genesis_hash, params_hash, height:u32, tip}`,
+  `1 Block`, `2 Tx`, `3 GetBlocks{from_height:u32, count:u32}`,
+  `4 vec<Block>`, `5 Ping` (empty body). A `GetBlocks` reply holds main
+  chain blocks from `from_height` upward, at most 32, and stops after
+  8 MiB (always at least one block); a request for heights the node does
+  not have is answered with an empty list. Each side sends `Ping` every
+  60 s; a peer silent for 300 s (30 s before its `Hello`) is dropped. A
+  node serves at most 64 inbound peers and re-dials its configured
+  outbound peers every 2 s.
+* **NET-2.** Peers whose `Hello` names a different network, genesis or
+  `params_hash` are disconnected.
+* **NET-3.** Blocks that become part of a node's best chain, and
+  transactions it admits, are relayed to all other peers. Block download
+  keeps at most one `GetBlocks` outstanding per peer:
+  (a) a peer whose `Hello` announces a greater height is asked for the
+  blocks above the node's tip;
+  (b) a block with an unknown parent (the peer is on another branch)
+  triggers a request for the 32 heights ending at the node's tip, and
+  each reply that again contains a block with an unknown parent moves
+  that window down by 32, until height 1;
+  (c) a reply whose blocks were all already known or stored as side-chain
+  blocks is followed by a request for the next heights, so that after the
+  fork point is found the node walks forward until a block connects or
+  reorganizes;
+  (d) a reply that extends the best chain continues from the new tip, as
+  long as the peer announced a greater height or relayed a block with an
+  unknown parent while the request was outstanding (it has mined past the
+  height in its `Hello`); an empty reply or one containing an invalid
+  block ends the exchange.
+  A node answers every `GetBlocks`, with an empty `Blocks` if it has
+  nothing, holds at most one `Blocks` reply per peer in memory, and drops
+  a peer that does not take a frame within 300 s.
 * **NET-4.** Chain selection: the valid chain with the greatest height
   wins (constant difficulty makes height equivalent to work); ties keep the
   current chain.
+* **NET-5.** A node stores only blocks it has fully validated, and
+  validates only blocks whose parent it has stored. After the cheap
+  checks (HDR-4, HDR-6, HDR-7, POW-1, BLK-12, PRF-7 and the policy
+  `time ≤ now + 2 h`) the receipt is verified (PRF-3) and §9–§12 are run:
+  against the node's UTXO set and the block witness for a block that
+  extends the best chain, and statelessly — against the witness and the
+  parent's `state_root` alone (STATE-2) — for a block on any other
+  branch. Because every stored block is valid, a second copy of a stored
+  hash is ignored even if its uncommitted bytes differ (BLK-1), and a
+  rejected copy leaves no trace, so it cannot shadow a valid one.
+  ("Side chain" here always means a competing branch of this same chain,
+  i.e. blocks that are valid but not on the node's best chain — never a
+  separate chain.) Side-chain blocks are kept up to 64 MiB of encoded
+  size. Over that budget the oldest stored side-chain block that is not
+  an ancestor of the block just stored is evicted; if only that block's
+  own branch is left and it is still over the budget, the new block is
+  dropped instead, so stored branches stay connected. (A competing branch
+  that needs more than 64 MiB of side storage therefore cannot be adopted;
+  see DECISIONS, known limitations.) A block whose ancestor is not stored
+  is treated as having an unknown parent. The cheap checks also include
+  BLK-7, so an oversized transaction list is refused before PRF-3.
+  A reorganization rebuilds the UTXO set from the genesis
+  state by applying the stored blocks without re-verifying signatures or
+  receipts, and requires every resulting root to equal the block's
+  `state_root`.
+* **NET-6.** The mempool holds at most 1 000 transactions / 16 MiB. A
+  transaction is admitted only if it could fit a block on its own
+  (BLK-8, BLK-9, and BLK-7 with 640 bytes reserved for the coinbase and
+  the transaction count — the same reserve block templates use) and is
+  fully valid against the UTXO set plus every transaction already in the
+  mempool (so mempool double spends are rejected). After every new tip an
+  entry stays iff each of its inputs still resolves to exactly the coin
+  it was validated against and IN-2, IN-3 and TX-8 hold at the next
+  height; no signature or receipt is verified again, because SIG-1/MIG-3
+  bind them to that coin. (Consequence: a transaction spending an
+  *unconfirmed* output is only minable in the same block as its parent at
+  the height it was signed for, since the leaf it signed includes the
+  parent's confirmation height.) Transactions of blocks disconnected by a
+  reorganization are re-validated in full and return ahead of the waiting
+  entries; coinbases never return. A node mining real proofs does not
+  admit transactions carrying fake migration receipts.
+* **NET-7.** The first frame a peer sends MUST be `Hello`; anything else
+  disconnects the peer.
 * **RPC-1.** JSON-RPC 2.0 at `POST /`. Methods: `getblockchaininfo`,
   `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`,
   `getrawblock`, `getrawtransaction`, `decoderawtransaction`,
   `sendrawtransaction`, `getrawmempool`, `listunspent`, `listlegacy`,
-  `getcoin`, `getbalance`, `generate`, `getpeerinfo`, `getparams`.
+  `getcoin`, `getbalance`, `generate` (at most 1 000 blocks per call),
+  `getpeerinfo`, `getparams`. `getblockchaininfo` reports, among others,
+  `params_hash`, `block_image_id`, `migrate_image_id`,
+  `require_real_proofs` and the node's `prove_mode`. There is no
+  authentication: bind the RPC to a trusted interface only.
 
 ---
 
@@ -515,15 +676,15 @@ For input `i` of transaction `tx` spending coin `c` at block height `h`:
 | Encoding | ENC-1 … ENC-8 |
 | Outputs / coins | OUT-1 … OUT-6, AMT-1, COIN-1 |
 | Transactions | TX-1 … TX-10 |
-| Blocks | BLK-1 … BLK-11 |
-| Parameters | PAR-1 … PAR-3 |
+| Blocks | BLK-1 … BLK-12 |
+| Parameters | PAR-1 … PAR-5 |
 | SMT | SMT-1 … SMT-8 |
 | Header / PoW | HDR-1 … HDR-7, POW-1, POW-2 |
 | Inputs / signatures | IN-1 … IN-3, SIG-1 … SIG-3, AMT-2 |
 | Coinbase | CB-1 … CB-5 |
 | State | STATE-1 … STATE-5 |
 | Genesis | GEN-1 … GEN-5 |
-| Proofs | PRF-1 … PRF-6 |
+| Proofs | PRF-1 … PRF-8 |
 | Legacy / migration | LEG-1 … LEG-3, MIG-1 … MIG-7 |
 | Cryptography | CRYPTO-1 … CRYPTO-4 |
-| Non-consensus | ADDR-1, NET-1 … NET-4, RPC-1 |
+| Non-consensus | ADDR-1, NET-1 … NET-7, RPC-1 |

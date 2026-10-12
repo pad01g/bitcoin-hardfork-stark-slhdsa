@@ -24,6 +24,10 @@ pub struct RpcContext {
     pub mining: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Upper bound on blocks per `generate` call (the mining lock is held for
+/// the whole call).
+pub const MAX_GENERATE: u64 = 1000;
+
 pub fn router(ctx: RpcContext) -> Router {
     Router::new().route("/", post(handle)).with_state(ctx)
 }
@@ -53,6 +57,22 @@ fn u64_from(v: Option<&Value>) -> Result<u64> {
     v.and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("expected integer"))
 }
 
+fn u32_from(v: Option<&Value>) -> Result<u32> {
+    u32::try_from(u64_from(v)?).map_err(|_| anyhow!("integer out of range"))
+}
+
+/// Optional `min_confirmations` parameter (default 0).
+fn minconf_from(v: Option<&Value>) -> Result<u32> {
+    match v {
+        None | Some(Value::Null) => Ok(0),
+        some => u32_from(some),
+    }
+}
+
+fn peers(ctx: &RpcContext) -> std::sync::MutexGuard<'_, Vec<(u64, std::net::SocketAddr)>> {
+    ctx.net.peers.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn kind_json(k: &OutputKind) -> Value {
     match k {
         OutputKind::P2pkSlh { pkh } => json!({ "type": "p2pk_slh", "pkh": hex::encode(pkh) }),
@@ -74,21 +94,15 @@ fn coin_json(hrp: &str, op: &OutPoint, c: &Coin) -> Value {
 fn block_json(c: &ChainState, b: &Block) -> Value {
     let hash = b.hash();
     let height = c.heights.get(&hash).copied();
-    let receipt_kind = if b.receipt.is_empty() {
-        "none"
-    } else if bhss_prover::decode_receipt(&b.receipt).map(|r| bhss_prover::is_fake(&r)).unwrap_or(true) {
-        "fake"
-    } else {
-        "stark"
-    };
+    let receipt_kind = if b.receipt.is_empty() { "none".to_string() } else { bhss_prover::receipt_kind(&b.receipt).to_string() };
     json!({
         "hash": hex::encode(hash), "height": height, "version": b.header.version,
         "previousblockhash": hex::encode(b.header.prev_hash), "merkleroot": hex::encode(b.header.merkle_root),
         "state_root": hex::encode(b.header.state_root), "time": b.header.time, "bits": format!("{:08x}", b.header.bits),
         "nonce": b.header.nonce, "tx": b.txs.iter().map(|t| hex::encode(t.txid())).collect::<Vec<_>>(),
-        "size": b.committed_tx_bytes(), "receipt_bytes": b.receipt.len(), "receipt_kind": receipt_kind,
+        "committed_tx_bytes": b.committed_tx_bytes(), "receipt_bytes": b.receipt.len(), "receipt_kind": receipt_kind,
         "witness_coins": b.witness.coins.len(), "witness_proofs": b.witness.proofs.len(),
-        "in_main_chain": height.map(|h| c.main.get(h as usize) == Some(&hash)).unwrap_or(false),
+        "in_main_chain": c.on_main(&hash),
     })
 }
 
@@ -108,49 +122,49 @@ fn tx_json(t: &Transaction) -> Value {
 async fn dispatch(ctx: RpcContext, method: &str, p: Vec<Value>) -> Result<Value> {
     match method {
         "getblockchaininfo" => {
-            let c = ctx.chain.lock().unwrap();
+            let c = crate::chain::lock(&ctx.chain);
             Ok(json!({
                 "chain": c.params.name, "blocks": c.height(), "bestblockhash": hex::encode(c.tip.hash),
                 "state_root": hex::encode(c.tip.state_root), "genesis_hash": hex::encode(c.genesis_hash),
                 "params_hash": hex::encode(c.params_hash), "utxos": c.state.coins.len(),
-                "mempool": c.mempool.txs.len(), "peers": ctx.net.peers.lock().unwrap().len(),
+                "mempool": c.mempool.entries.len(), "peers": peers(&ctx).len(),
                 "block_image_id": hex::encode(bhss_prover::block_image_id()),
                 "migrate_image_id": hex::encode(bhss_prover::migrate_image_id()),
                 "require_real_proofs": c.params.require_real_proofs, "prove_mode": format!("{:?}", ctx.prover.mode).to_lowercase(),
             }))
         }
-        "getblockcount" => Ok(json!(ctx.chain.lock().unwrap().height())),
-        "getbestblockhash" => Ok(json!(hex::encode(ctx.chain.lock().unwrap().tip.hash))),
+        "getblockcount" => Ok(json!(crate::chain::lock(&ctx.chain).height())),
+        "getbestblockhash" => Ok(json!(hex::encode(crate::chain::lock(&ctx.chain).tip.hash))),
         "getblockhash" => {
-            let h = u64_from(p.first())? as u32;
-            let c = ctx.chain.lock().unwrap();
+            let h = u32_from(p.first())?;
+            let c = crate::chain::lock(&ctx.chain);
             Ok(json!(hex::encode(c.main.get(h as usize).ok_or_else(|| anyhow!("height out of range"))?)))
         }
         "getblock" => {
             let hash = hash_from(p.first())?;
-            let c = ctx.chain.lock().unwrap();
+            let c = crate::chain::lock(&ctx.chain);
             let b = c.blocks.get(&hash).ok_or_else(|| anyhow!("block not found"))?;
             Ok(block_json(&c, b))
         }
         "getrawblock" => {
             let hash = hash_from(p.first())?;
-            let c = ctx.chain.lock().unwrap();
+            let c = crate::chain::lock(&ctx.chain);
             let b = c.blocks.get(&hash).ok_or_else(|| anyhow!("block not found"))?;
             Ok(json!(hex::encode(b.to_bytes())))
         }
         "getrawtransaction" => {
             let txid = hash_from(p.first())?;
-            let c = ctx.chain.lock().unwrap();
+            let c = crate::chain::lock(&ctx.chain);
             if let Some(bh) = c.tx_index.get(&txid) {
-                let b = &c.blocks[bh];
-                let t = b.txs.iter().find(|t| t.txid() == txid).unwrap();
-                let mut v = tx_json(t);
-                v["blockhash"] = json!(hex::encode(bh));
-                v["height"] = json!(c.heights.get(bh));
-                return Ok(v);
+                if let Some(t) = c.blocks.get(bh).and_then(|b| b.txs.iter().find(|t| t.txid() == txid)) {
+                    let mut v = tx_json(t);
+                    v["blockhash"] = json!(hex::encode(bh));
+                    v["height"] = json!(c.heights.get(bh));
+                    return Ok(v);
+                }
             }
-            if let Some((t, _)) = c.mempool.txs.iter().find(|(t, _)| t.txid() == txid) {
-                return Ok(tx_json(t));
+            if let Some(e) = c.mempool.get(&txid) {
+                return Ok(tx_json(&e.tx));
             }
             bail!("transaction not found")
         }
@@ -162,22 +176,28 @@ async fn dispatch(ctx: RpcContext, method: &str, p: Vec<Value>) -> Result<Value>
         "sendrawtransaction" => {
             let hexs = p.first().and_then(|v| v.as_str()).ok_or_else(|| anyhow!("expected hex"))?;
             let t = Transaction::from_bytes(&hex::decode(hexs)?).map_err(|e| anyhow!("decode: {e}"))?;
-            let txid = ctx.chain.lock().unwrap().add_to_mempool(t.clone())?;
-            ctx.net.broadcast(Message::Tx(t));
+            // Signature / receipt verification is CPU work: keep it off the
+            // async runtime.
+            let chain = ctx.chain.clone();
+            let t2 = t.clone();
+            let (txid, new) = tokio::task::spawn_blocking(move || crate::chain::lock(&chain).add_to_mempool(t2)).await??;
+            if new {
+                ctx.net.broadcast(Message::Tx(t));
+            }
             Ok(json!(hex::encode(txid)))
         }
         "getrawmempool" => {
-            let c = ctx.chain.lock().unwrap();
-            Ok(json!(c.mempool.txs.iter().map(|(t, _)| hex::encode(t.txid())).collect::<Vec<_>>()))
+            let c = crate::chain::lock(&ctx.chain);
+            Ok(json!(c.mempool.entries.iter().map(|e| hex::encode(e.txid)).collect::<Vec<_>>()))
         }
         "listunspent" => {
             // params: [address | null, min_confirmations?]
-            let c = ctx.chain.lock().unwrap();
+            let c = crate::chain::lock(&ctx.chain);
             let kind = match p.first() {
                 Some(Value::String(a)) => Some(address::decode(&c.params.name, a).map_err(|e| anyhow!("address: {e}"))?),
                 _ => None,
             };
-            let minconf = p.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let minconf = minconf_from(p.get(1))?;
             let tip = c.height();
             let mut v: Vec<Value> = c
                 .find_coins(kind.as_ref())
@@ -189,7 +209,7 @@ async fn dispatch(ctx: RpcContext, method: &str, p: Vec<Value>) -> Result<Value>
             Ok(Value::Array(v))
         }
         "listlegacy" => {
-            let c = ctx.chain.lock().unwrap();
+            let c = crate::chain::lock(&ctx.chain);
             let script = p.first().and_then(|v| v.as_str()).map(hex::decode).transpose()?;
             let v: Vec<Value> = c
                 .state
@@ -206,8 +226,8 @@ async fn dispatch(ctx: RpcContext, method: &str, p: Vec<Value>) -> Result<Value>
         }
         "getcoin" => {
             let txid = hash_from(p.first())?;
-            let vout = u64_from(p.get(1))? as u32;
-            let c = ctx.chain.lock().unwrap();
+            let vout = u32_from(p.get(1))?;
+            let c = crate::chain::lock(&ctx.chain);
             let op = OutPoint::new(txid, vout);
             let coin = c.state.get(&op).ok_or_else(|| anyhow!("coin not found"))?;
             let proof = c.state.smt.prove(&op.smt_key());
@@ -218,16 +238,19 @@ async fn dispatch(ctx: RpcContext, method: &str, p: Vec<Value>) -> Result<Value>
             Ok(v)
         }
         "getbalance" => {
-            let c = ctx.chain.lock().unwrap();
+            let c = crate::chain::lock(&ctx.chain);
             let a = p.first().and_then(|v| v.as_str()).ok_or_else(|| anyhow!("expected address"))?;
             let kind = address::decode(&c.params.name, a).map_err(|e| anyhow!("address: {e}"))?;
-            let minconf = p.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let minconf = minconf_from(p.get(1))?;
             let tip = c.height();
             let sum: u64 = c.find_coins(Some(&kind)).iter().filter(|(_, coin)| tip + 1 - coin.height >= minconf).map(|(_, coin)| coin.output.value).sum();
             Ok(json!(sum))
         }
         "generate" => {
             let n = u64_from(p.first())?;
+            if n > MAX_GENERATE {
+                bail!("generate: at most {MAX_GENERATE} blocks per call");
+            }
             let a = p.get(1).and_then(|v| v.as_str()).ok_or_else(|| anyhow!("expected address"))?.to_string();
             let _guard = ctx.mining.lock().await;
             let mut hashes = Vec::new();
@@ -238,11 +261,11 @@ async fn dispatch(ctx: RpcContext, method: &str, p: Vec<Value>) -> Result<Value>
             Ok(json!(hashes))
         }
         "getpeerinfo" => {
-            let peers = ctx.net.peers.lock().unwrap();
+            let peers = peers(&ctx);
             Ok(json!(peers.iter().map(|(id, addr)| json!({ "id": id, "addr": addr.to_string() })).collect::<Vec<_>>()))
         }
         "getparams" => {
-            let c = ctx.chain.lock().unwrap();
+            let c = crate::chain::lock(&ctx.chain);
             Ok(serde_json::to_value(&c.params)?)
         }
         _ => bail!("unknown method {method}"),
@@ -251,12 +274,10 @@ async fn dispatch(ctx: RpcContext, method: &str, p: Vec<Value>) -> Result<Value>
 
 async fn generate_one(ctx: &RpcContext, address: &str) -> Result<Hash32> {
     let (template, payout) = {
-        let c = ctx.chain.lock().unwrap();
+        let c = crate::chain::lock(&ctx.chain);
         let payout = address::decode(&c.params.name, address).map_err(|e| anyhow!("address: {e}"))?;
-        let height = c.height() + 1;
-        let cb_size = miner::coinbase_tx(height, 0, payout.clone()).committed_size();
-        let (txs, coins) = miner::select_txs(&c.params, cb_size, &c.mempool.txs);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as u32;
+        let (txs, coins) = miner::select_txs(&c.params, &c.mempool.entries);
+        let now = u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()).map_err(|_| anyhow!("clock beyond u32 seconds"))?;
         (
             miner::Template { params: c.params.clone(), genesis_hash: c.genesis_hash, prev: c.tip.clone(), txs, coins, state: c.state.clone(), time: now },
             payout,
@@ -265,12 +286,14 @@ async fn generate_one(ctx: &RpcContext, address: &str) -> Result<Hash32> {
     let prover = ctx.prover.clone();
     let block = tokio::task::spawn_blocking(move || miner::seal_and_prove(template, payout, &prover)).await??;
     let hash = block.hash();
-    {
-        let mut c = ctx.chain.lock().unwrap();
-        match c.accept_block(block.clone(), true)? {
-            crate::chain::Accept::Connected => {}
-            other => bail!("mined block not connected: {other:?} (tip moved?)"),
-        }
+    let accepted = {
+        let chain = ctx.chain.clone();
+        let b = block.clone();
+        tokio::task::spawn_blocking(move || crate::chain::lock(&chain).accept_block(b, true)).await??
+    };
+    match accepted {
+        crate::chain::Accept::Connected => {}
+        other => bail!("mined block not connected: {other:?} (tip moved?)"),
     }
     tracing::info!(hash = hex::encode(hash), "mined block");
     ctx.net.broadcast(Message::Block(block));

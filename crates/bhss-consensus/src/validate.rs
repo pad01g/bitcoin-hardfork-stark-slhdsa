@@ -1,4 +1,4 @@
-//! Block and transaction validation (SPEC §9, §10, §12).
+//! Block and transaction validation (SPEC §6 and §9–§12).
 
 use alloc::format;
 use alloc::string::String;
@@ -29,7 +29,7 @@ impl std::error::Error for ConsensusError {}
 
 pub type Result<T> = core::result::Result<T, ConsensusError>;
 
-fn fail<T>(rule: &'static str, detail: impl Into<String>) -> Result<T> {
+pub(crate) fn fail<T>(rule: &'static str, detail: impl Into<String>) -> Result<T> {
     Err(ConsensusError { rule, detail: detail.into() })
 }
 
@@ -120,6 +120,13 @@ pub fn connect_block<S: StateView, M: MigrationChecker>(
     if h.merkle_root != body_merkle_root(&block.txs) {
         return fail("BLK-3", "merkle root mismatch");
     }
+    // BLK-11, checked before any expensive work: one proof per state
+    // operation. (Block builders call `apply_block_body` directly with an
+    // empty proof list to record the proofs; validators come through here.)
+    let expected_ops = expected_state_ops(&block.txs);
+    if block.witness.proofs.len() != expected_ops {
+        return fail("BLK-11", format!("witness has {} SMT proofs for {expected_ops} state operations", block.witness.proofs.len()));
+    }
 
     let body = apply_block_body(params, genesis_hash, height, &block.txs, &block.witness, state, migrations)?;
 
@@ -137,6 +144,15 @@ pub fn connect_block<S: StateView, M: MigrationChecker>(
         sig_checks: body.sig_checks,
         migrations: body.migrations,
     })
+}
+
+/// BLK-11: number of SMT operations a block performs (STATE-1): one deletion
+/// per non-coinbase input, one insertion per non-Data output of every
+/// transaction including the coinbase.
+pub fn expected_state_ops(txs: &[Transaction]) -> usize {
+    let inputs: usize = txs.iter().skip(1).map(|t| t.inputs.len()).sum();
+    let outputs: usize = txs.iter().map(|t| t.outputs.iter().filter(|o| !o.kind.is_data()).count()).sum();
+    inputs + outputs
 }
 
 /// BLK-3: Merkle root over `tx_commit` of every transaction.
@@ -213,25 +229,30 @@ pub fn apply_block_body<S: StateView, M: MigrationChecker>(
         }
         let coins = &witness.coins[coin_cursor..coin_cursor + tx.inputs.len()];
         coin_cursor += tx.inputs.len();
+        // BLK-8 / BLK-9 are decided from the counts alone, before any
+        // signature is verified, so an over-limit block costs nothing.
+        let tx_sigs: u32 = tx.inputs.iter().map(|i| match &i.witness { Witness::Slh { signers } => signers.len() as u32, _ => 0 }).sum();
+        if sig_checks.saturating_add(tx_sigs) > params.max_sig_checks {
+            return fail("BLK-8", format!("{} signature checks > {}", sig_checks.saturating_add(tx_sigs), params.max_sig_checks));
+        }
+        let tx_legacy = coins.iter().filter(|c| c.output.kind.is_legacy()).count() as u32;
+        if n_migrations.saturating_add(tx_legacy) > params.max_migrations {
+            return fail("BLK-9", format!("{} migrations > {}", n_migrations.saturating_add(tx_legacy), params.max_migrations));
+        }
         let r = apply_tx(&ctx, tx, &txid, tx_index, coins, state, migrations)?;
-        fees = fees.checked_add(r.fee).ok_or_else(|| ConsensusError { rule: "AMT-1", detail: "fee overflow".into() })?;
+        fees = fees.checked_add(r.fee).filter(|f| *f <= MAX_MONEY).ok_or_else(|| ConsensusError { rule: "AMT-1", detail: "fee sum".into() })?;
         sig_checks += r.sig_checks;
         n_migrations += r.migrations;
-        if sig_checks > params.max_sig_checks {
-            return fail("BLK-8", format!("{sig_checks} signature checks > {}", params.max_sig_checks));
-        }
-        if n_migrations > params.max_migrations {
-            return fail("BLK-9", format!("{n_migrations} migrations > {}", params.max_migrations));
-        }
     }
 
     // ---- coinbase outputs (CB-*) ----
     let cb = &txs[0];
-    let out_sum = output_sum(cb, "CB-3")?;
+    let out_sum = output_sum(cb, "AMT-1")?;
     let allowed = params
         .subsidy(height)
         .checked_add(fees)
-        .ok_or_else(|| ConsensusError { rule: "CB-3", detail: "subsidy overflow".into() })?;
+        .filter(|a| *a <= MAX_MONEY)
+        .ok_or_else(|| ConsensusError { rule: "AMT-1", detail: "subsidy + fees".into() })?;
     if out_sum > allowed {
         return fail("CB-3", format!("coinbase pays {out_sum} > {allowed}"));
     }
@@ -254,10 +275,10 @@ fn check_coinbase_structure(tx: &Transaction, height: u32) -> Result<()> {
         return fail("TX-1", "coinbase without outputs");
     }
     if !tx.proofs.is_empty() {
-        return fail("TX-9", "coinbase carries proofs");
+        return fail("CB-5", "coinbase carries proofs");
     }
     if tx.locktime != 0 {
-        return fail("TX-8", "coinbase locktime");
+        return fail("CB-5", "coinbase locktime");
     }
     check_outputs_well_formed(tx)?;
     Ok(())
@@ -266,7 +287,13 @@ fn check_coinbase_structure(tx: &Transaction, height: u32) -> Result<()> {
 fn check_outputs_well_formed(tx: &Transaction) -> Result<()> {
     for (i, o) in tx.outputs.iter().enumerate() {
         if !o.kind.is_well_formed() {
-            return fail("OUT-2", format!("output {i} malformed"));
+            let rule = match &o.kind {
+                OutputKind::MultisigSlh { .. } => "OUT-2",
+                OutputKind::Timelock { .. } => "OUT-3",
+                OutputKind::Data { .. } => "OUT-4",
+                _ => "OUT-6",
+            };
+            return fail(rule, format!("output {i} malformed"));
         }
         if o.kind.is_legacy() {
             return fail("OUT-6", format!("output {i} creates a Legacy output"));
@@ -298,11 +325,10 @@ fn create_outputs<S: StateView>(tx: &Transaction, txid: &Hash32, height: u32, co
             continue; // OUT-5: never enters the state
         }
         let op = OutPoint::new(*txid, vout as u32);
-        let coin = Coin { output: o.clone(), height, coinbase };
-        match state.create(&op, &coin) {
+        match state.create(&op, &coin_for(o, height, coinbase)) {
             Ok(()) => {}
             Err(StateError::AlreadyExists) => return fail("STATE-4", format!("outpoint {vout} already exists")),
-            Err(e) => return fail("STATE-2", format!("{e:?}")),
+            Err(e) => return fail("STATE-2", format!("output {vout}: {e:?}")),
         }
     }
     Ok(())
@@ -314,17 +340,12 @@ pub struct TxResult {
     pub migrations: u32,
 }
 
-/// Validate a non-coinbase transaction against `coins` (one per input) and
-/// apply it to `state` (TX-*, IN-*, SIG-*, MIG-*, AMT-1, STATE-1).
-pub fn apply_tx<S: StateView, M: MigrationChecker>(
-    ctx: &TxContext<'_>,
-    tx: &Transaction,
-    txid: &Hash32,
-    tx_index: usize,
-    coins: &[Coin],
-    state: &mut S,
-    migrations: &mut M,
-) -> Result<TxResult> {
+/// The crypto-free part of transaction validation: structure (TX-*), the
+/// migration shape (MIG-1, TX-9, PRF-7), maturity and timelocks (IN-2,
+/// IN-3) and the amount rules (AMT-1, AMT-2). Returns the fee. Everything
+/// here depends only on `ctx.height` and the spent coins, which is what a
+/// mempool has to re-check after each block.
+pub fn check_tx_context(ctx: &TxContext<'_>, tx: &Transaction, coins: &[Coin]) -> Result<u64> {
     if tx.version != Transaction::VERSION {
         return fail("TX-1", format!("version {}", tx.version));
     }
@@ -358,10 +379,14 @@ pub fn apply_tx<S: StateView, M: MigrationChecker>(
     if tx.proofs.len() != n_legacy {
         return fail("TX-9", format!("{} proofs for {n_legacy} legacy inputs", tx.proofs.len()));
     }
+    if let Some(p) = tx.proofs.iter().find(|p| p.len() > MAX_RECEIPT_LEN) {
+        return fail("PRF-7", format!("migration receipt of {} bytes > {MAX_RECEIPT_LEN}", p.len()));
+    }
 
+    // Cheap checks and the amount rules first (IN-2, IN-3, AMT-1, AMT-2), so
+    // that no signature is verified for a transaction that fails them.
     let mut in_sum: u64 = 0;
-    let mut sig_checks: u32 = 0;
-    for (index, (input, coin)) in tx.inputs.iter().zip(coins).enumerate() {
+    for (index, coin) in coins.iter().enumerate() {
         // IN-2 maturity
         if coin.coinbase && ctx.height < coin.height.saturating_add(ctx.params.coinbase_maturity) {
             return fail("IN-2", format!("input {index} spends immature coinbase"));
@@ -375,6 +400,31 @@ pub fn apply_tx<S: StateView, M: MigrationChecker>(
                 return fail("IN-3", format!("input {index} relative timelock"));
             }
         }
+        in_sum = in_sum.checked_add(coin.output.value).filter(|s| *s <= MAX_MONEY).ok_or_else(|| ConsensusError { rule: "AMT-1", detail: "input sum".into() })?;
+    }
+    let out_sum = output_sum(tx, "AMT-1")?;
+    if in_sum < out_sum {
+        return fail("AMT-2", format!("inputs {in_sum} < outputs {out_sum}"));
+    }
+    Ok(in_sum - out_sum)
+}
+
+/// Validate a non-coinbase transaction against `coins` (one per input) and
+/// apply it to `state` (TX-*, IN-*, SIG-*, MIG-*, AMT-1, STATE-1).
+pub fn apply_tx<S: StateView, M: MigrationChecker>(
+    ctx: &TxContext<'_>,
+    tx: &Transaction,
+    txid: &Hash32,
+    tx_index: usize,
+    coins: &[Coin],
+    state: &mut S,
+    migrations: &mut M,
+) -> Result<TxResult> {
+    let fee = check_tx_context(ctx, tx, coins)?;
+    let n_legacy = coins.iter().filter(|c| c.output.kind.is_legacy()).count();
+
+    let mut sig_checks: u32 = 0;
+    for (index, (input, coin)) in tx.inputs.iter().zip(coins).enumerate() {
         let leaf = coin.leaf_hash();
         match (&input.witness, &coin.output.kind) {
             (Witness::Slh { signers }, kind) if kind.slh_condition().is_some() => {
@@ -392,45 +442,72 @@ pub fn apply_tx<S: StateView, M: MigrationChecker>(
             (Witness::Coinbase, _) => return fail("IN-1", format!("input {index} coinbase witness")),
             _ => return fail("IN-1", format!("input {index} witness does not match coin")),
         }
-        in_sum = in_sum.checked_add(coin.output.value).ok_or_else(|| ConsensusError { rule: "AMT-1", detail: "input overflow".into() })?;
         match state.spend(&input.prevout, coin) {
             Ok(()) => {}
             Err(StateError::MissingOrMismatch) => return fail("STATE-3", format!("input {index} not in UTXO set")),
-            Err(e) => return fail("STATE-2", format!("{e:?}")),
+            Err(e) => return fail("STATE-2", format!("input {index}: {e:?}")),
         }
     }
-    let out_sum = output_sum(tx, "AMT-1")?;
-    if in_sum < out_sum {
-        return fail("AMT-2", format!("inputs {in_sum} < outputs {out_sum}"));
-    }
     create_outputs(tx, txid, ctx.height, false, state)?;
-    Ok(TxResult { fee: in_sum - out_sum, sig_checks, migrations: n_legacy as u32 })
+    Ok(TxResult { fee, sig_checks, migrations: n_legacy as u32 })
 }
 
-/// SIG-2 / SIG-3. Returns the number of signatures verified.
+/// COIN-1: the coin a transaction output becomes.
+pub fn coin_for(output: &Output, height: u32, coinbase: bool) -> Coin {
+    Coin { output: output.clone(), height, coinbase }
+}
+
+/// Apply an already-validated block to `state` without re-checking it. The
+/// final state equals the one STATE-1 defines (coinbase outputs go in first
+/// here, last there; no input can refer to them). `coins` are the witness
+/// coins, one per non-coinbase input. Errors only if the block was invalid.
+pub fn apply_block_unchecked<S: StateView>(txs: &[Transaction], coins: &[Coin], height: u32, state: &mut S) -> core::result::Result<(), StateError> {
+    let mut cursor = 0;
+    for (i, tx) in txs.iter().enumerate() {
+        let txid = tx.txid();
+        if i > 0 {
+            for input in &tx.inputs {
+                let coin = coins.get(cursor).ok_or(StateError::BadProof)?;
+                cursor += 1;
+                state.spend(&input.prevout, coin)?;
+            }
+        }
+        for (vout, o) in tx.outputs.iter().enumerate() {
+            if o.kind.is_data() {
+                continue;
+            }
+            state.create(&OutPoint::new(txid, vout as u32), &coin_for(o, height, i == 0))?;
+        }
+    }
+    Ok(())
+}
+
+/// SIG-2 (single key) / SIG-3 (multisig): every failure is reported under
+/// the rule of the condition being spent. Returns the number of signatures
+/// verified.
 fn check_slh_signers(cond: &OutputKind, signers: &[SlhSigner], msg: &Hash32, index: usize) -> Result<u32> {
-    let (k, pkhs): (usize, &[Hash32]) = match cond {
-        OutputKind::P2pkSlh { pkh } => (1, core::slice::from_ref(pkh)),
-        OutputKind::MultisigSlh { k, pkhs } => (*k as usize, pkhs.as_slice()),
+    let (rule, k, pkhs): (&'static str, usize, &[Hash32]) = match cond {
+        OutputKind::P2pkSlh { pkh } => ("SIG-2", 1, core::slice::from_ref(pkh)),
+        OutputKind::MultisigSlh { k, pkhs } => ("SIG-3", *k as usize, pkhs.as_slice()),
         _ => return fail("IN-1", "not an SLH condition"),
     };
     if signers.len() != k {
-        return fail("SIG-3", format!("input {index}: {} signers, need {k}", signers.len()));
+        return fail(rule, format!("input {index}: {} signers, need {k}", signers.len()));
     }
     let mut last: Option<u8> = None;
     for s in signers {
         if let Some(l) = last {
             if s.index <= l {
-                return fail("SIG-3", format!("input {index}: signer indices not strictly increasing"));
+                return fail(rule, format!("input {index}: signer indices not strictly increasing"));
             }
         }
         last = Some(s.index);
-        let pkh = pkhs.get(s.index as usize).ok_or_else(|| ConsensusError { rule: "SIG-3", detail: format!("input {index}: signer index out of range") })?;
+        let pkh = pkhs.get(s.index as usize).ok_or_else(|| ConsensusError { rule, detail: format!("input {index}: signer index out of range") })?;
         if slh_pubkey_hash(&s.pubkey) != *pkh {
-            return fail("SIG-2", format!("input {index}: pubkey hash mismatch"));
+            return fail(rule, format!("input {index}: pubkey hash mismatch"));
         }
         if !bhss_slhdsa::verify(&s.pubkey, msg, &s.signature) {
-            return fail("SIG-2", format!("input {index}: invalid SLH-DSA signature"));
+            return fail(rule, format!("input {index}: invalid SLH-DSA signature"));
         }
     }
     Ok(signers.len() as u32)

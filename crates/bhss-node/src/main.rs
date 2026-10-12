@@ -46,6 +46,10 @@ async fn main() -> Result<()> {
     let params: ChainParams = serde_json::from_str(&std::fs::read_to_string(&args.params).context("read params")?)?;
     let coins = bhss_snapshot::decode_genesis_state(&std::fs::read(&args.genesis_state).context("read genesis state")?)?;
     let mut chain = chain::ChainState::new(params, coins, args.datadir.clone())?;
+    chain.real_miner = args.prove_mode == ProveMode::Real;
+    if bhss_prover::dev_mode_env() {
+        tracing::warn!("RISC0_DEV_MODE is set in the environment; it is ignored by receipt verification (PRF-5) and refused by --prove-mode real");
+    }
     let replayed = chain.load_from_disk()?;
     tracing::info!(
         network = chain.params.name,
@@ -59,7 +63,11 @@ async fn main() -> Result<()> {
     );
     let chain = Arc::new(Mutex::new(chain));
     let net = Arc::new(p2p::Network::new(chain.clone()));
-    tokio::spawn(net.clone().listen(args.p2p_bind));
+    // Bind before spawning so a taken port is a startup error, not a node
+    // that silently has no P2P.
+    let p2p_listener = tokio::net::TcpListener::bind(args.p2p_bind).await.with_context(|| format!("bind p2p {}", args.p2p_bind))?;
+    tracing::info!(bind = %args.p2p_bind, "p2p listening");
+    tokio::spawn(net.clone().listen(p2p_listener));
     for target in args.connect {
         tokio::spawn(net.clone().connect_loop(target));
     }
@@ -69,7 +77,7 @@ async fn main() -> Result<()> {
         prover: ProverConfig { mode: args.prove_mode, segment_po2: Some(args.segment_po2) },
         mining: Arc::new(tokio::sync::Mutex::new(())),
     };
-    let listener = tokio::net::TcpListener::bind(args.rpc_bind).await?;
+    let listener = tokio::net::TcpListener::bind(args.rpc_bind).await.with_context(|| format!("bind rpc {}", args.rpc_bind))?;
     tracing::info!(bind = %args.rpc_bind, "rpc listening");
     axum::serve(listener, rpc::router(ctx)).await?;
     Ok(())

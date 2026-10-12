@@ -101,6 +101,8 @@ pub struct Decoder<'a> {
     pos: usize,
 }
 
+// `len()` here reads a CompactSize length prefix; it is not a collection.
+#[allow(clippy::len_without_is_empty)]
 impl<'a> Decoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }

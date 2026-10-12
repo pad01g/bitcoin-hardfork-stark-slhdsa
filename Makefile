@@ -30,9 +30,9 @@ DOCKER_RUN = docker run --rm --platform $(PLATFORM) \
 	-e RUST_LOG=$${RUST_LOG:-info} \
 	-w $(WORKDIR) $(DOCKER_RUN_EXTRA) $(IMAGE)
 
-.PHONY: image build test check clippy prove e2e e2e-real shell clean-volumes bins
+.PHONY: image build test check clippy prove e2e e2e-real shell _shell clean-volumes bins
 
-image:            ## Build the dev image (Rust 1.88 + rzup + RISC Zero 3.0.6)
+image:            ## Build the dev image (Rust 1.98.1 + rzup + RISC Zero 3.0.6, guest Rust 1.97.0)
 	docker build --platform $(PLATFORM) -t $(IMAGE) -f docker/Dockerfile docker
 
 build:            ## cargo build --release (guest programs are built by build.rs)
@@ -45,23 +45,31 @@ bins: build       ## Copy release binaries out of the target volume into ./bin
 check:
 	$(DOCKER_RUN) cargo check --workspace --all-targets
 
+# Lints only: the guest build is skipped (RISC0_SKIP_BUILD) because the
+# nested guest cargo invocation does not work under clippy's driver.
 clippy:
-	$(DOCKER_RUN) cargo clippy --workspace --all-targets -- -D warnings
+	$(DOCKER_RUN) sh -c 'rustup component list --installed | grep -q clippy || rustup component add clippy; RISC0_SKIP_BUILD=1 cargo clippy --workspace --all-targets --no-deps -- -D warnings'
 
+# --release on purpose: the per-package overflow-checks of the release
+# profile are what ships, so that is what the tests exercise.
 test:             ## Unit + integration tests (RISC Zero dev-mode, seconds)
 	$(DOCKER_RUN) cargo test --release --workspace --no-fail-fast
 
-prove:            ## Produce and verify a REAL STARK for a small block (CPU; minutes)
+prove:            ## Produce and verify REAL STARKs for a 3-block chain (CPU; tens of minutes to hours)
 	$(DOCKER_RUN) cargo test --release -p bhss-prover --features real-proof-tests -- --nocapture real_block_proof
 
 e2e: bins         ## Multi-node regtest end-to-end test (dev-mode proofs)
 	PROVE_MODE=dev SEGMENT_PO2=$(SEGMENT_PO2) tests/e2e.sh
 
-e2e-real: bins    ## End-to-end with real STARKs for every block (slow)
-	PROVE_MODE=real SEGMENT_PO2=$(SEGMENT_PO2) tests/e2e.sh
+# Maturity 1 keeps the chain to 7 blocks: every one of them is really proven.
+e2e-real: bins    ## End-to-end with real STARKs for every block (hours on CPU)
+	E2E_MATURITY=$${E2E_MATURITY:-1} PROVE_MODE=real SEGMENT_PO2=$(SEGMENT_PO2) tests/e2e.sh
 
 shell:            ## Interactive shell in the dev image
-	docker run --rm -it --platform $(PLATFORM) -v "$(CURDIR):$(WORKDIR)" -v $(CARGO_VOL):/usr/local/cargo/registry -v $(TARGET_VOL):$(WORKDIR)/target -v $(RISC0_VOL):/root/.cache -w $(WORKDIR) $(IMAGE) bash
+	$(MAKE) --no-print-directory DOCKER_RUN_EXTRA=-it _shell
+
+_shell:
+	$(DOCKER_RUN) bash
 
 clean-volumes:
 	docker volume rm -f $(CARGO_VOL) $(TARGET_VOL) $(RISC0_VOL)

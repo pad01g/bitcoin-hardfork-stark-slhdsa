@@ -375,6 +375,21 @@ mod tests {
     }
 
     #[test]
+    fn non_canonical_sibling_rejected() {
+        // SMT-6: a proof that lists the empty hash as a non-empty sibling.
+        let t = Smt::from_leaves([(k(1), l(1))]);
+        let mut p = t.prove(&k(2));
+        assert!(!p.has_sibling(255));
+        p.set_sibling(255);
+        p.siblings.push(*t.empty_hashes().at(256));
+        assert_eq!(compute_root(t.empty_hashes(), &k(2), &EMPTY_LEAF, &p), Err(ProofError::NonCanonical));
+        // A sibling count that disagrees with the bitmap is malformed.
+        let mut p = t.prove(&k(2));
+        p.siblings.push([9u8; 32]);
+        assert_eq!(compute_root(t.empty_hashes(), &k(2), &EMPTY_LEAF, &p), Err(ProofError::Malformed));
+    }
+
+    #[test]
     fn proof_encoding_roundtrip() {
         use bhss_primitives::{Decode, Encode};
         let mut t = Smt::new();

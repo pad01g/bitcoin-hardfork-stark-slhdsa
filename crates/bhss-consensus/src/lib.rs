@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod build;
 pub mod genesis;
 pub mod state;
 pub mod validate;
@@ -15,7 +16,8 @@ pub mod validate;
 pub use bhss_primitives as primitives;
 pub use state::{ProofBackedState, StateError, StateView};
 pub use state::{DualState, FullState};
+pub use build::assemble_block;
 pub use validate::{
-    apply_block_body, apply_tx, body_merkle_root, connect_block, BlockSummary, BodyResult, ConsensusError,
-    MigrationChecker, NoMigrations, PrevState, Result, TxContext, TxResult,
+    apply_block_body, apply_block_unchecked, apply_tx, body_merkle_root, check_tx_context, coin_for, connect_block, expected_state_ops,
+    BlockSummary, BodyResult, ConsensusError, MigrationChecker, NoMigrations, PrevState, Result, TxContext, TxResult,
 };

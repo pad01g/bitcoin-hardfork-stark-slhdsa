@@ -8,7 +8,7 @@ description = "Builds the BHSS genesis state from a Bitcoin Core dumptxoutset fi
 [dependencies]
 bhss-primitives = { workspace = true, features = ["std", "serde"] }
 bhss-consensus = { workspace = true, features = ["std"] }
-bhss-legacy = { workspace = true, features = ["sign"] }
+bhss-methods = { workspace = true }
 k256 = { workspace = true, features = ["std", "arithmetic"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
